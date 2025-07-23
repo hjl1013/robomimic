@@ -42,6 +42,8 @@ class DiffusionPolicyConfig(BaseConfig):
         self.algo.optim_params.policy.learning_rate.epoch_schedule = [] # epochs where LR decay occurs (used by "linear" and "multistep" schedulers)
         self.algo.optim_params.policy.learning_rate.do_not_lock_keys()
         self.algo.optim_params.policy.regularization.L2 = 1e-6          # L2 regularization strength
+        self.algo.optim_params.policy.num_train_batches = 3
+        self.algo.optim_params.policy.num_epochs = 2
 
         # horizon parameters
         self.algo.horizon.observation_horizon = 2
