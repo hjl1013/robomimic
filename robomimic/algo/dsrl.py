@@ -315,7 +315,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         return action
         
     def _get_action_trajectory(self, obs_dict, goal_dict=None):
-        # assert not self.nets.training
+        assert not self.nets.training
         To = self.algo_config.horizon.observation_horizon
         Ta = self.algo_config.horizon.action_horizon
         Tp = self.algo_config.horizon.prediction_horizon

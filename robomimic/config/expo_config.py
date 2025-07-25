@@ -23,7 +23,11 @@ class ExpoConfig(BaseConfig):
         # set compatible data loading parameters
         self.train.seq_length = 16 # should match self.algo.base_policy.horizon.prediction_horizon
         self.train.frame_stack = 2 # should match self.algo.base_policy.horizon.observation_horizon
-        self.train.num_rollouts = 10
+        
+        # onlinerl parameters
+        self.train.online_rollout_collection.n = 10
+        self.train.critic_training.n_iter = 10
+        self.train.discount_factor = 0.99
     
     def algo_config(self):
         """
@@ -55,6 +59,7 @@ class ExpoConfig(BaseConfig):
 
         # base policy parameters
         self.algo.base_policy = config_factory("diffusion_policy").algo
+        self.algo.base_policy_ckpt_path = "/home/hyunjun/projects/PreciseManip/sim/training/diffusion_policy_trained_models/DP_training/original/models/model_epoch_1500_low_dim_v15_success_0.18.pth"
 
         # edit policy parameters
         self.algo.edit_policy.net.type = "gaussian"
@@ -68,6 +73,8 @@ class ExpoConfig(BaseConfig):
         self.algo.edit_policy.net.gmm.min_std = 0.0001
         self.algo.edit_policy.layer_dims = [300, 400]
         self.algo.edit_policy.max_gradient_norm = None
+        self.algo.edit_policy.entropy_weight = 0.01
+        self.algo.edit_policy.beta = 0.05
 
         # critic parameters
         self.algo.critic.ensemble.n = 2
@@ -75,6 +82,7 @@ class ExpoConfig(BaseConfig):
         self.algo.critic.use_huber = False
         self.algo.critic.max_gradient_norm = None
         self.algo.critic.value_bounds = None
+        self.algo.critic.target_tau = 0.01
 
         # replay buffer parameters
         self.algo.replay_buffer.capacity = 1000000

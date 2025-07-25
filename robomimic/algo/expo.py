@@ -13,10 +13,10 @@ import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.loss_utils as LossUtils
+import robomimic.utils.file_utils as FileUtils
 from robomimic.utils.replay_buffer import ReplayBuffer
 
 from robomimic.algo import register_algo_factory_func, PolicyAlgo, ValueAlgo, algo_factory, DiffusionPolicyUNet
-from robomimic.models.policy_nets import PerturbationActorNetwork
 
 
 @register_algo_factory_func("expo")
@@ -44,6 +44,7 @@ class Expo(PolicyAlgo, ValueAlgo):
         self.replay_buffer = ReplayBuffer(
             capacity=self.algo_config.replay_buffer.capacity,
             obs_key_shapes=self.obs_key_shapes,
+            frame_stack=self.global_config.train.frame_stack,
             action_dim=self.ac_dim,
         )
 
@@ -57,29 +58,24 @@ class Expo(PolicyAlgo, ValueAlgo):
         
         with torch.no_grad():
             TorchUtils.hard_update(
-                source=self.critic, 
-                target=self.critic_target,
+                source=self.nets["critic"], 
+                target=self.nets["critic_target"],
             )
 
         # convert to float and move to device. base policy is already moved to device in DiffusionPolicyUNet
-        self.edit_policy = self.edit_policy.float().to(self.device)
-        self.critic = self.critic.float().to(self.device)
-        self.critic_target = self.critic_target.float().to(self.device)
+        self.nets["edit_policy"] = self.nets["edit_policy"].float().to(self.device)
+        self.nets["critic"] = self.nets["critic"].float().to(self.device)
+        self.nets["critic_target"] = self.nets["critic_target"].float().to(self.device)
 
     def reset(self):
         self.base_policy.reset()
-
-    def set_eval(self):
-        self.base_policy.set_eval()
-        self.edit_policy.eval()
-        self.critic.eval()
-        self.critic_target.eval()
 
     def _create_base_policy(self):
         """
         Creates the base policy network. Using DP for base policy
         TODO: Check how to upload pretrained model
         """
+        assert self.algo_config.base_policy_ckpt_path is not None, "base_policy_ckpt_path is not set"
         self.base_policy = DiffusionPolicyUNet(
             algo_config=self.algo_config.base_policy,
             obs_config=self.obs_config,
@@ -88,22 +84,27 @@ class Expo(PolicyAlgo, ValueAlgo):
             ac_dim=self.ac_dim,
             device=self.device,
         )
-    
+        self.nets["base_policy"] = self.base_policy.nets
+        ckpt_dict = FileUtils.load_dict_from_checkpoint(ckpt_path=self.algo_config.base_policy_ckpt_path)
+        self.base_policy.deserialize(ckpt_dict["model"])
+
     def _create_edit_policy(self):
         """
         Creates the action edit policy network.
         TODO: Action edit policy implementation should change. it should get base action as input
         """
-        edit_policy_class = PerturbationActorNetwork
+        edit_policy_class = PolicyNets.GaussianActorNetwork
+        edit_policy_obs_shapes = copy.deepcopy(self.obs_shapes)
+        edit_policy_obs_shapes["base_action"] = (self.ac_dim, )
         edit_policy_args = dict(
-            obs_shapes=self.obs_shapes,
+            obs_shapes=edit_policy_obs_shapes,
             goal_shapes=self.goal_shapes,
             ac_dim=self.ac_dim,
             mlp_layer_dims=self.algo_config.edit_policy.layer_dims,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
         )
 
-        self.edit_policy = edit_policy_class(**edit_policy_args)
+        self.nets["edit_policy"] = edit_policy_class(**edit_policy_args)
     
     def _create_critic(self):
         """
@@ -120,79 +121,132 @@ class Expo(PolicyAlgo, ValueAlgo):
         )
 
         # Q network ensemble and target ensemble
-        self.critic = nn.ModuleList()
-        self.critic_target = nn.ModuleList()
+        self.nets["critic"] = nn.ModuleList()
+        self.nets["critic_target"] = nn.ModuleList()
         for _ in range(self.algo_config.critic.ensemble.n):
             critic = critic_class(**critic_args)
-            self.critic.append(critic)
+            self.nets["critic"].append(critic)
 
             critic_target = critic_class(**critic_args)
-            self.critic_target.append(critic_target)
+            self.nets["critic_target"].append(critic_target)
 
     def _get_target_q_values(self, obs_dict, action, goal_dict):
         """
         Helper function to get Q-values for a given observation and action.
+
+        Args:
+            obs_dict (dict): dictionary of (N, Do) sized obervations
+            action (torch.Tensor): (N, ac_dim) sized action
+            goal_dict (dict): dictionary of (N, Dg) sized goals
+
+        Returns:
+            q_values (torch.Tensor): (N, ) sized Q-values
         TODO: Make this parallelized
         """
         with torch.no_grad():
-            q_values = []
-            for target_critic in self.critic_target:
-                q_value = target_critic(obs_dict, action, goal_dict)
-                q_values.append(q_value)
-            q_values = torch.cat(q_values, dim=0)
-            return q_values.min()
+            q_values = torch.cat([
+                target_critic(obs_dict, action, goal_dict)
+                for target_critic in self.nets["critic_target"]
+            ], dim=1)
+            return q_values.min(dim=1).values.unsqueeze(1)
+
+    def _get_q_values(self, obs_dict, action, goal_dict):
+        """
+        Helper function to get Q-values for a given observation and action.
+
+        Args:
+            obs_dict (dict): dictionary of (N, Do) sized obervations
+            action (torch.Tensor): (N, ac_dim) sized action
+            goal_dict (dict): dictionary of (N, Dg) sized goals
+
+        Returns:
+            q_values (torch.Tensor): (N, ) sized Q-values
+        TODO: Make this parallelized
+        """
+        with torch.no_grad():
+            q_values = torch.cat([
+                critic(obs_dict, action, goal_dict)
+                for critic in self.nets["critic"]
+            ], dim=1)
+            return q_values.min(dim=1).values.unsqueeze(1)
 
     def get_action(self, obs_dict, goal_dict=None):
         """
         Based on EXPO algorithm, sample base action + action edit action. Select the hightest Q-value action out of samples
+        We should consider diffusion with no action chunking.
 
         Args:
             obs_dict (dict): dictionary of observations
+                each obervation has N samples
             goal_dict (dict): dictionary of goals
 
         Returns:
             action (torch.Tensor): action
         """
-        assert self.algo_config.on_the_fly_samples == 1, "sampling more than 1 action is not implemented" # TODO: Implement this
+        # self.base_policy.set_eval()
+        sample_num = self.algo_config.on_the_fly_samples
+
+        # sample base actions
+        duplicated_obs_dict = {obs_key: obs_dict[obs_key].repeat_interleave(sample_num, dim=0) for obs_key in obs_dict}
+        base_actions = self.base_policy._get_action_trajectory(duplicated_obs_dict, goal_dict)[:, 0, :] # [N * sample_num, ac_dim] we assume no action chunking
         
-        # sample base and action edit actions
-        base_actions = self.base_policy.get_action(obs_dict, goal_dict) # [N, ac_dim]
-        edit_policy_obs_dict = copy.deepcopy(obs_dict)
-        example_key = list(obs_dict.keys())[0]
-        if len(obs_dict[example_key].shape) == 3:
-            edit_policy_obs_dict = {obs_key: obs_dict[obs_key][:, -1, :] for obs_key in obs_dict}
-        edit_actions = self.edit_policy(edit_policy_obs_dict, base_actions, goal_dict) # [N, ac_dim]
-        action_samples = base_actions + edit_actions # [N, ac_dim]
+        # sample action edits
+        edit_policy_obs_dict = copy.deepcopy(duplicated_obs_dict)
+        if self.global_config.train.frame_stack > 1:
+            edit_policy_obs_dict = {obs_key: duplicated_obs_dict[obs_key][:, -1, :] for obs_key in duplicated_obs_dict} # action edit doesn't use frame stack
+        edit_policy_obs_dict["base_action"] = base_actions
+        edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) # [N * sample_num, ac_dim]
+
+        # combine base actions and action edits
+        action_samples = base_actions + edit_actions # [N * sample_num, ac_dim]
+        action_samples = action_samples.reshape(-1, sample_num, self.ac_dim) # [N, sample_num, ac_dim]
 
         # select the action with the highest Q-value
-        q_values = torch.stack([
-            self._get_target_q_values(edit_policy_obs_dict, action_sample.unsqueeze(0), goal_dict)
-            for action_sample in action_samples
-        ], dim=0)  # Shape: [N]
-        action_index = torch.argmax(q_values).item()
-        return action_samples[action_index:action_index+1]
-    
-    def _get_target_values(self, next_states, goal_states, rewards, dones):
+        q_values = torch.cat([
+            self._get_q_values(edit_policy_obs_dict, action_samples[:, i, :], goal_dict)
+            for i in range(sample_num)
+        ], dim=1)  # Shape: [N, sample_num]
+        action_index = torch.argmax(q_values, dim=1)
+        return action_samples[torch.arange(action_samples.shape[0]), action_index, :] # [N, ac_dim]
+
+    def get_base_edit_action(self, obs_dict, goal_dict=None):
         """
-        Helper function to get target values for training Q-function with TD-loss.
+        Based on EXPO algorithm, sample base action + action edit action.
 
         Args:
-            next_states (dict): batch of next observations
-            goal_states (dict): if not None, batch of goal observations
-            rewards (torch.Tensor): batch of rewards - should be shape (B, 1)
-            dones (torch.Tensor): batch of done signals - should be shape (B, 1)
+            obs_dict (dict): dictionary of observations
+                each obervation has N samples
+            goal_dict (dict): dictionary of goals
 
         Returns:
-            q_targets (torch.Tensor): target Q-values to use for TD loss
+            action (torch.Tensor): action
         """
+        # self.base_policy.set_eval()
+        sample_num = self.algo_config.on_the_fly_samples
 
-        with torch.no_grad():
-            ########################
-            # TODO: Implement this
-            ########################
-            q_targets = None
+        # sample base actions
+        duplicated_obs_dict = {obs_key: obs_dict[obs_key].repeat_interleave(sample_num, dim=0) for obs_key in obs_dict}
+        base_actions = self.base_policy._get_action_trajectory(duplicated_obs_dict, goal_dict)[:, 0, :] # [N * sample_num, ac_dim] we assume no action chunking
+        
+        # sample action edits
+        edit_policy_obs_dict = copy.deepcopy(duplicated_obs_dict)
+        if self.global_config.train.frame_stack > 1:
+            edit_policy_obs_dict = {obs_key: duplicated_obs_dict[obs_key][:, -1, :] for obs_key in duplicated_obs_dict} # action edit doesn't use frame stack
+        edit_policy_obs_dict["base_action"] = base_actions
+        edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) # [N * sample_num, ac_dim]
 
-        return q_targets
+        # combine base actions and action edits
+        base_actions = base_actions.reshape(-1, sample_num, self.ac_dim) # [N, sample_num, ac_dim]
+        edit_actions = edit_actions.reshape(-1, sample_num, self.ac_dim) # [N, sample_num, ac_dim]
+        action_samples = base_actions + edit_actions # [N * sample_num, ac_dim]
+
+        # select the action with the highest Q-value
+        q_values = torch.cat([
+            self._get_q_values(edit_policy_obs_dict, action_samples[:, i, :], goal_dict)
+            for i in range(sample_num)
+        ], dim=1)  # Shape: [N, sample_num]
+        action_index = torch.argmax(q_values, dim=1)
+        return base_actions[torch.arange(base_actions.shape[0]), action_index, :], edit_actions[torch.arange(edit_actions.shape[0]), action_index, :] # [N, ac_dim]
 
     def _compute_critic_loss(self, critic, states, actions, goal_states, q_targets):
         """
@@ -239,12 +293,54 @@ class Expo(PolicyAlgo, ValueAlgo):
                 that might be relevant for logging
         """
         info = OrderedDict()
-
-        ########################
-        # TODO: Impliment this function
-        ########################
-
         print("train_critic_on_batch")
+        
+        # get batch values
+        obs = batch["obs"]
+        actions = batch["actions"]
+        next_obs = batch["next_obs"]
+        rewards = batch["rewards"]
+        dones = batch["dones"]
+
+        # reshape obs and next_obs if frame_stack is greater than 1
+        if self.global_config.train.frame_stack > 1:
+            unstacked_obs = {obs_key: obs[obs_key][:, -1, :] for obs_key in obs}
+            unstacked_next_obs = {obs_key: next_obs[obs_key][:, -1, :] for obs_key in next_obs}
+
+        # Q predictions
+        pred_qs = [critic(obs_dict=unstacked_obs, acts=actions, goal_dict=None)
+                   for critic in self.nets["critic"]]
+
+        # target Q value
+        next_actions = self.get_action(next_obs)
+        target_qs = self._get_target_q_values(unstacked_next_obs, next_actions, None)
+        q_target = rewards + self.global_config.train.discount_factor * (1 - dones) * target_qs
+        q_target = q_target.detach()
+
+        # compute critic losses
+        critic_losses = []
+        td_loss_fcn = nn.SmoothL1Loss() if self.algo_config.critic.use_huber else nn.MSELoss()
+        for (i, q_pred) in enumerate(pred_qs):
+            # Calculate td error loss
+            td_loss = td_loss_fcn(q_pred, q_target)
+            info[f"critic/critic{i+1}_loss"] = td_loss
+            critic_losses.append(td_loss)
+        
+        # update critic
+        if not no_backprop:
+            for (critic_loss, critic, critic_target, optimizer) in zip(
+                critic_losses, self.nets["critic"], self.nets["critic_target"], self.optimizers["critic"]
+            ):
+                TorchUtils.backprop_for_loss(
+                    net=critic,
+                    optim=optimizer,
+                    loss=critic_loss,
+                    max_grad_norm=self.algo_config.critic.max_gradient_norm,
+                    retain_graph=False,
+                )
+                with torch.no_grad():
+                    TorchUtils.soft_update(source=critic, target=critic_target, tau=self.algo_config.critic.target_tau)
+
         return info
     
     def _train_base_policy_on_batch(self, batch, epoch, no_backprop=False):
@@ -252,19 +348,72 @@ class Expo(PolicyAlgo, ValueAlgo):
         TODO: Implement this function
         """
         print("train_base_policy_on_batch")
-        return OrderedDict()
+        raise NotImplementedError("train_base_policy_on_batch is not implemented")
+        # info = OrderedDict()
+
+        # batch["goal_obs"] = None
+        # info_base_policy = self.base_policy.train_on_batch(batch, epoch, validate=no_backprop)
+        # info = {f"base_policy/{key}": value for key, value in info_base_policy.items()}
+
+        return info
     
     def _train_edit_policy_on_batch(self, batch, epoch, no_backprop=False):
         """
         TODO: Implement this function
         """
         print("train_edit_policy_on_batch")
-        return OrderedDict()
+        info = OrderedDict()
+
+        # get batch values
+        obs = batch["obs"]
+
+        # reshape obs and next_obs if frame_stack is greater than 1
+        if self.global_config.train.frame_stack > 1:
+            unstacked_obs = {obs_key: obs[obs_key][:, -1, :] for obs_key in obs}
+
+        # calculate actions
+        base_actions, _ = self.get_base_edit_action(obs, None)
+        base_actions = base_actions.detach()
+
+        # 1. prepare edit_policy input
+        edit_policy_obs_dict = copy.deepcopy(unstacked_obs)  # s
+        edit_policy_obs_dict["base_action"] = base_actions   # a
+
+        # 2. sample edit actions (a_hat) and get distribution
+        dist = self.nets["edit_policy"].forward_train(edit_policy_obs_dict, goal_dict=None)
+        a_hat = dist.rsample()  # reparameterized sampling
+        log_prob = dist.log_prob(a_hat)  # shape [B,]
+
+        # 3. evaluate Q(s, a + a_hat)
+        combined_action = base_actions + a_hat
+        q_pred = self._get_q_values(unstacked_obs, combined_action, goal_dict=None)  # shape [B, 1]
+
+        # 4. compute loss
+        alpha = self.algo_config.edit_policy.entropy_weight  # entropy regularization
+        actor_loss = (-q_pred + alpha * log_prob.unsqueeze(1)).mean()
+
+        # 5. return info
+        info["edit_policy/loss"] = actor_loss
+        info["edit_policy/log_prob"] = log_prob.mean()
+        info["edit_policy/q_pred"] = q_pred.mean()
+
+        if not no_backprop:
+            TorchUtils.backprop_for_loss(
+                net=self.nets["edit_policy"],
+                optim=self.optimizers["edit_policy"],
+                loss=actor_loss,
+                max_grad_norm=self.algo_config.edit_policy.max_gradient_norm,
+                retain_graph=False,
+            )
+
+        return info
         
-    def train_on_batch(self, epoch, validate=False):
+    def train_one_epoch(self, epoch, validate=False):
         """
         Trains the policy and critic networks on a batch of data.
         """
+        self.set_train()
+
         with TorchUtils.maybe_no_grad(no_grad=validate):
             info = PolicyAlgo.train_on_batch(self, None, epoch, validate=validate) # simple checking
 
@@ -280,8 +429,11 @@ class Expo(PolicyAlgo, ValueAlgo):
             # Sample actions and use bellman backup to train critic
             # Iterate G times
             ########################
-            for _ in range(self.algo_config.critic.n_iter):
-                mini_batch = self.replay_buffer.sample_mini_batch(self.algo_config.critic.batch_size)
+            for _ in range(self.global_config.train.critic_training.n_iter):
+                mini_batch = self.replay_buffer.sample_mini_batch(
+                    self.global_config.train.batch_size,
+                    self.device
+                )
                 critic_info = self._train_critic_on_batch(
                     batch=mini_batch, 
                     epoch=epoch, 
@@ -295,16 +447,20 @@ class Expo(PolicyAlgo, ValueAlgo):
             # For pi_base, use the last mini-batch with supervised learning
             # For pi_edit, use the last mini-batch maximizing objective Q - alpha * log (pi_edit)
             ########################
-            last_mini_batch = self.replay_buffer.last_mini_batch(self.algo_config.critic.batch_size)
-            base_policy_info = self._train_base_policy_on_batch(
-                batch=last_mini_batch, 
-                epoch=epoch, 
-                no_backprop=validate,
+            last_mini_batch = self.replay_buffer.last_mini_batch(
+                self.global_config.train.batch_size,
+                self.device
             )
+            # I think we don't have to update base policy. I will not implement this
+            # base_policy_info = self._train_base_policy_on_batch(
+            #     batch=last_mini_batch, 
+            #     epoch=epoch, 
+            #     no_backprop=validate,
+            # )
             edit_policy_info = self._train_edit_policy_on_batch(
                 batch=last_mini_batch, 
                 epoch=epoch, 
                 no_backprop=validate,
             )
-            info.update(base_policy_info)
+            # info.update(base_policy_info)
             info.update(edit_policy_info)

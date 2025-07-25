@@ -210,7 +210,7 @@ def train(config, device, resume=False):
             action_normalization_stats=action_normalization_stats,
         )
 
-        num_episodes = config.train.num_rollouts
+        num_episodes = config.train.online_rollout_collection.n
         stats, traj = rollout(
             policy=rollout_model,
             env=envs[list(envs.keys())[0]],
@@ -218,7 +218,17 @@ def train(config, device, resume=False):
             render=False,
             return_obs=True,
         )
+
+        model.replay_buffer.batched_insert(
+            obs={obs_key: torch.from_numpy(traj["obs"][obs_key]).float() for obs_key in traj["obs"]},
+            action=torch.from_numpy(traj["actions"]).float(),
+            reward=torch.from_numpy(traj["rewards"]).float()[:, None],
+            next_obs={obs_key: torch.from_numpy(traj["next_obs"][obs_key]).float() for obs_key in traj["next_obs"]},
+            done=torch.from_numpy(traj["dones"]).float()[:, None],
+        )
+        
         # TODO: Update model
+        model.train_one_epoch(epoch, validate=False)
 
 
 def main(args):
