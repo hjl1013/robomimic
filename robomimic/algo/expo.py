@@ -199,13 +199,13 @@ class Expo(PolicyAlgo, ValueAlgo):
 
         # combine base actions and action edits
         action_samples = base_actions + edit_actions # [N * sample_num, ac_dim]
+        q_values = self._get_q_values(edit_policy_obs_dict, action_samples, goal_dict) # [N * sample_num, 1]
+        
+        # reshape action and q_values
         action_samples = action_samples.reshape(-1, sample_num, self.ac_dim) # [N, sample_num, ac_dim]
+        q_values = q_values.reshape(-1, sample_num) # [N, sample_num]
 
         # select the action with the highest Q-value
-        q_values = torch.cat([
-            self._get_q_values(edit_policy_obs_dict, action_samples[:, i, :], goal_dict)
-            for i in range(sample_num)
-        ], dim=1)  # Shape: [N, sample_num]
         action_index = torch.argmax(q_values, dim=1)
         return action_samples[torch.arange(action_samples.shape[0]), action_index, :] # [N, ac_dim]
 
@@ -235,17 +235,18 @@ class Expo(PolicyAlgo, ValueAlgo):
         edit_policy_obs_dict["base_action"] = base_actions
         edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) # [N * sample_num, ac_dim]
 
-        # combine base actions and action edits
+        # combine base actions and action edits and calculate q-values
+        action_samples = base_actions + edit_actions # [N * sample_num, ac_dim]
+        q_values = self._get_q_values(edit_policy_obs_dict, action_samples, goal_dict) # [N * sample_num, 1]
+        
+        # reshape q_values and select the action with the highest Q-value
+        q_values = q_values.reshape(-1, sample_num) # [N, sample_num]
+        action_index = torch.argmax(q_values, dim=1)
+
+        # reshape action samples
         base_actions = base_actions.reshape(-1, sample_num, self.ac_dim) # [N, sample_num, ac_dim]
         edit_actions = edit_actions.reshape(-1, sample_num, self.ac_dim) # [N, sample_num, ac_dim]
-        action_samples = base_actions + edit_actions # [N * sample_num, ac_dim]
 
-        # select the action with the highest Q-value
-        q_values = torch.cat([
-            self._get_q_values(edit_policy_obs_dict, action_samples[:, i, :], goal_dict)
-            for i in range(sample_num)
-        ], dim=1)  # Shape: [N, sample_num]
-        action_index = torch.argmax(q_values, dim=1)
         return base_actions[torch.arange(base_actions.shape[0]), action_index, :], edit_actions[torch.arange(edit_actions.shape[0]), action_index, :] # [N, ac_dim]
 
     def _compute_critic_loss(self, critic, states, actions, goal_states, q_targets):
