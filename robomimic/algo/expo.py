@@ -14,6 +14,7 @@ import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.loss_utils as LossUtils
 import robomimic.utils.file_utils as FileUtils
+import robomimic.utils.log_utils as LogUtils
 from robomimic.utils.replay_buffer import ReplayBuffer
 
 from robomimic.algo import register_algo_factory_func, PolicyAlgo, ValueAlgo, algo_factory, DiffusionPolicyUNet
@@ -294,7 +295,6 @@ class Expo(PolicyAlgo, ValueAlgo):
                 that might be relevant for logging
         """
         info = OrderedDict()
-        print("train_critic_on_batch")
         
         # get batch values
         obs = batch["obs"]
@@ -362,7 +362,6 @@ class Expo(PolicyAlgo, ValueAlgo):
         """
         TODO: Implement this function
         """
-        print("train_edit_policy_on_batch")
         info = OrderedDict()
 
         # get batch values
@@ -418,19 +417,14 @@ class Expo(PolicyAlgo, ValueAlgo):
         with TorchUtils.maybe_no_grad(no_grad=validate):
             info = PolicyAlgo.train_on_batch(self, None, epoch, validate=validate) # simple checking
 
-            ########################
-            # TODO: Collect rollouts
-            # We can take this out of this function and put it in online_rl.py
-            # We will treat it as offline RL for now
-            ########################
 
-            # Critic training
             ########################
-            # TODO: Train critic
+            # Train critic
             # Sample actions and use bellman backup to train critic
             # Iterate G times
             ########################
-            for _ in range(self.global_config.train.critic_training.n_iter):
+            print("Training critic")
+            for _ in LogUtils.custom_tqdm(range(self.global_config.train.n_iter.critic)):
                 mini_batch = self.replay_buffer.sample_mini_batch(
                     self.global_config.train.batch_size,
                     self.device
@@ -441,27 +435,30 @@ class Expo(PolicyAlgo, ValueAlgo):
                     no_backprop=validate,
                 )
                 info.update(critic_info)
-            ########################
 
             ########################
-            # TODO: Update pi_base and pi_edit
+            # Update pi_base and pi_edit
             # For pi_base, use the last mini-batch with supervised learning
             # For pi_edit, use the last mini-batch maximizing objective Q - alpha * log (pi_edit)
             ########################
-            last_mini_batch = self.replay_buffer.last_mini_batch(
-                self.global_config.train.batch_size,
-                self.device
-            )
-            # I think we don't have to update base policy. I will not implement this
-            # base_policy_info = self._train_base_policy_on_batch(
-            #     batch=last_mini_batch, 
-            #     epoch=epoch, 
-            #     no_backprop=validate,
-            # )
-            edit_policy_info = self._train_edit_policy_on_batch(
-                batch=last_mini_batch, 
-                epoch=epoch, 
-                no_backprop=validate,
-            )
-            # info.update(base_policy_info)
-            info.update(edit_policy_info)
+            print("Training edit policy")
+            for _ in LogUtils.custom_tqdm(range(self.global_config.train.n_iter.edit_policy)):
+                last_mini_batch = self.replay_buffer.last_mini_batch(
+                    self.global_config.train.batch_size,
+                    self.device
+                )
+                # I think we don't have to update base policy. I will not implement this
+                # base_policy_info = self._train_base_policy_on_batch(
+                #     batch=last_mini_batch, 
+                #     epoch=epoch, 
+                #     no_backprop=validate,
+                # )
+                edit_policy_info = self._train_edit_policy_on_batch(
+                    batch=last_mini_batch, 
+                    epoch=epoch, 
+                    no_backprop=validate,
+                )
+                # info.update(base_policy_info)
+                info.update(edit_policy_info)
+
+        return info

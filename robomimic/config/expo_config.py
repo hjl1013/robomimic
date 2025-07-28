@@ -26,7 +26,8 @@ class ExpoConfig(BaseConfig):
         
         # onlinerl parameters
         self.train.online_rollout_collection.n = 10
-        self.train.critic_training.n_iter = 10
+        self.train.n_iter.critic = 10
+        self.train.n_iter.edit_policy = 1
         self.train.discount_factor = 0.99
     
     def algo_config(self):
