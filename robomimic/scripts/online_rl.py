@@ -147,7 +147,7 @@ def train(config, device, resume=False):
                 env_kwargs = dict(
                     env_meta=env_meta,
                     env_name=env_name,
-                    render=False,
+                    render=config.experiment.render,
                     render_offscreen=config.experiment.render_video,
                     use_image_obs=shape_meta["use_images"],
                 )
@@ -263,8 +263,9 @@ def train(config, device, resume=False):
                 policy=rollout_model,
                 env=envs[list(envs.keys())[0]],
                 horizon=config.experiment.rollout.horizon,
-                render=False,
+                render=config.experiment.render,
                 return_obs=True,
+                camera_names=["agentview", "robot0_eye_in_hand"]
             )
 
             model.replay_buffer.batched_insert(
@@ -307,7 +308,7 @@ def train(config, device, resume=False):
                 horizon=config.experiment.rollout.horizon,
                 use_goals=config.use_goals,
                 num_episodes=num_episodes,
-                render=False,
+                render=config.experiment.render,
                 video_dir=video_dir if config.experiment.render_video else None,
                 epoch=epoch,
                 video_skip=config.experiment.get("video_skip", 5),
