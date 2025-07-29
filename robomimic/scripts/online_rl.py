@@ -282,6 +282,20 @@ def train(config, device, resume=False):
         # setup checkpoint path
         epoch_ckpt_name = "model_epoch_{}".format(epoch)
 
+        # check for recurring checkpoint saving conditions
+        should_save_ckpt = False
+        if config.experiment.save.enabled:
+            time_check = (config.experiment.save.every_n_seconds is not None) and \
+                (time.time() - last_ckpt_time > config.experiment.save.every_n_seconds)
+            epoch_check = (config.experiment.save.every_n_epochs is not None) and \
+                (epoch > 0) and (epoch % config.experiment.save.every_n_epochs == 0)
+            epoch_list_check = (epoch in config.experiment.save.epochs)
+            should_save_ckpt = (time_check or epoch_check or epoch_list_check)
+        ckpt_reason = None
+        if should_save_ckpt:
+            last_ckpt_time = time.time()
+            ckpt_reason = "time"
+
         print("Train Epoch {}".format(epoch))
         print(json.dumps(safe_jsonify(step_log), sort_keys=True, indent=4))
         for k, v in step_log.items():
