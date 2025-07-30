@@ -1025,19 +1025,3 @@ class LowDimModality(Modality):
     @classmethod
     def _default_obs_unprocessor(cls, obs):
         return obs
-
-
-def frame_stack_obs(obs, frame_stack):
-    """
-    Frame stack observations
-    """
-    first_key = list(obs.keys())[0]
-    T = obs[first_key].shape[0]
-
-    new_obs = {}
-    for key, value in obs.items():
-        padding = value[0].unsqueeze(0).repeat(frame_stack - 1, 1)  # [frame_stack-1, obs_dim]
-        padded_value = torch.cat([padding, value], dim=0)  # [T + frame_stack - 1, obs_dim]
-        stacked_value = padded_value.unfold(dimension=0, size=frame_stack, step=1).permute(0, 2, 1)  # [T, frame_stack, obs_dim]
-        new_obs[key] = stacked_value
-    return new_obs

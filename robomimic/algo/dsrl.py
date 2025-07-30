@@ -1,37 +1,28 @@
-"""
-Implementation of Diffusion Policy https://diffusion-policy.cs.columbia.edu/ by Cheng Chi
-"""
-from typing import Callable, Union
-import math
 from collections import OrderedDict, deque
-from packaging.version import parse as parse_version
-import random
+import copy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# requires diffusers==0.11.1
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-from diffusers.training_utils import EMAModel
 
 import robomimic.models.obs_nets as ObsNets
-import robomimic.models.diffusion_policy_nets as DPNets
+import robomimic.models.policy_nets as PolicyNets
+import robomimic.models.value_nets as ValueNets
+import robomimic.models.vae_nets as VAENets
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.obs_utils as ObsUtils
+import robomimic.utils.loss_utils as LossUtils
+import robomimic.utils.file_utils as FileUtils
+import robomimic.utils.log_utils as LogUtils
+from robomimic.utils.replay_buffer import ReplayBuffer
 
-from robomimic.algo import register_algo_factory_func, PolicyAlgo
+from robomimic.algo import register_algo_factory_func, PolicyAlgo, ValueAlgo, algo_factory, DiffusionPolicyUNet
 
-import random
-import robomimic.utils.torch_utils as TorchUtils
-import robomimic.utils.tensor_utils as TensorUtils
-import robomimic.utils.obs_utils as ObsUtils
-
-
-@register_algo_factory_func("diffusion_policy")
+@register_algo_factory_func("dsrl")
 def algo_config_to_class(algo_config):
     """
-    Maps algo config to the BC algo class to instantiate, along with additional algo kwargs.
+    Maps algo config to the TD3_BC algo class to instantiate, along with additional algo kwargs.
 
     Args:
         algo_config (Config instance): algo config
@@ -40,223 +31,160 @@ def algo_config_to_class(algo_config):
         algo_class: subclass of Algo
         algo_kwargs (dict): dictionary of additional kwargs to pass to algorithm
     """
+    # only one variant of TD3_BC for now
+    return DSRL, {}
 
-    if algo_config.unet.enabled:
-        return DiffusionPolicyUNet, {}
-    elif algo_config.transformer.enabled:
-        raise NotImplementedError()
-    else:
-        raise RuntimeError()
+class DSRL(PolicyAlgo, ValueAlgo):
+    def __init__(self, **kwargs):
+        PolicyAlgo.__init__(self, **kwargs)
+        
+        self.replay_buffer = ReplayBuffer(
+            capacity=self.algo_config.replay_buffer.capacity,
+            obs_key_shapes=self.obs_key_shapes,
+            action_dim=self.ac_dim,
+            observation_horizon=self.algo_config.base_policy.horizon.observation_horizon,
+            action_horizon=self.algo_config.base_policy.horizon.action_horizon,
+        )
 
+    def _create_shapes(self, obs_keys, obs_key_shapes):
+        """
+        Create obs_shapes, goal_shapes, and subgoal_shapes dictionaries, to make it
+        easy for this algorithm object to keep track of observation key shapes. Each dictionary
+        maps observation key to shape.
 
-class DiffusionPolicyUNet(PolicyAlgo):
+        Args:
+            obs_keys (dict): dict of required observation keys for this training run (usually
+                specified by the obs config), e.g., {"obs": ["rgb", "proprio"], "goal": ["proprio"]}
+            obs_key_shapes (dict): dict of observation key shapes, e.g., {"rgb": [3, 224, 224]}
+        """
+        # determine shapes
+        self.obs_shapes = OrderedDict()
+        self.goal_shapes = OrderedDict()
+        self.subgoal_shapes = OrderedDict()
+
+        # We check across all modality groups (obs, goal, subgoal), and see if the inputted observation key exists
+        # across all modalitie specified in the config. If so, we store its corresponding shape internally
+        for k in obs_key_shapes:
+            if "obs" in self.obs_config.modalities and k in [obs_key for modality in self.obs_config.modalities.obs.values() for obs_key in modality]:
+                self.obs_shapes[k] = [self.algo_config.base_policy.horizon.observation_horizon, *obs_key_shapes[k]]
+            if "goal" in self.obs_config.modalities and k in [obs_key for modality in self.obs_config.modalities.goal.values() for obs_key in modality]:
+                self.goal_shapes[k] = obs_key_shapes[k]
+            if "subgoal" in self.obs_config.modalities and k in [obs_key for modality in self.obs_config.modalities.subgoal.values() for obs_key in modality]:
+                self.subgoal_shapes[k] = obs_key_shapes[k]
+
     def _create_networks(self):
         """
         Creates networks and places them into @self.nets.
         """
-        # set up different observation groups for @MIMO_MLP
-        observation_group_shapes = OrderedDict()
-        observation_group_shapes["obs"] = OrderedDict(self.obs_shapes)
-        encoder_kwargs = ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder)
-        
-        obs_encoder = ObsNets.ObservationGroupEncoder(
-            observation_group_shapes=observation_group_shapes,
-            encoder_kwargs=encoder_kwargs,
-        )
-        # IMPORTANT!
-        # replace all BatchNorm with GroupNorm to work with EMA
-        # performance will tank if you forget to do this!
-        obs_encoder = replace_bn_with_gn(obs_encoder)
-        
-        obs_dim = obs_encoder.output_shape()[0]
+        self._create_base_policy()
+        self._create_dsrl_policy()
+        self._create_base_critic()
+        self._create_dsrl_critic()
 
-        # create network object
-        noise_pred_net = DPNets.ConditionalUnet1D(
-            input_dim=self.ac_dim,
-            global_cond_dim=obs_dim*self.algo_config.horizon.observation_horizon
-        )
-
-        # the final arch has 2 parts
-        nets = nn.ModuleDict({
-            "policy": nn.ModuleDict({
-                "obs_encoder": obs_encoder,
-                "noise_pred_net": noise_pred_net
-            })
-        })
-
-        nets = nets.float().to(self.device)
-        
-        # setup noise scheduler
-        noise_scheduler = None
-        if self.algo_config.ddpm.enabled:
-            noise_scheduler = DDPMScheduler(
-                num_train_timesteps=self.algo_config.ddpm.num_train_timesteps,
-                beta_schedule=self.algo_config.ddpm.beta_schedule,
-                clip_sample=self.algo_config.ddpm.clip_sample,
-                prediction_type=self.algo_config.ddpm.prediction_type
+        with torch.no_grad():
+            TorchUtils.hard_update(
+                source=self.nets["base_critic"],
+                target=self.nets["base_critic_target"],
             )
-        elif self.algo_config.ddim.enabled:
-            noise_scheduler = DDIMScheduler(
-                num_train_timesteps=self.algo_config.ddim.num_train_timesteps,
-                beta_schedule=self.algo_config.ddim.beta_schedule,
-                clip_sample=self.algo_config.ddim.clip_sample,
-                set_alpha_to_one=self.algo_config.ddim.set_alpha_to_one,
-                steps_offset=self.algo_config.ddim.steps_offset,
-                prediction_type=self.algo_config.ddim.prediction_type
+            TorchUtils.hard_update(
+                source=self.nets["dsrl_critic"],
+                target=self.nets["dsrl_critic_target"],
             )
-        else:
-            raise RuntimeError()
-        
-        # setup EMA
-        ema = None
-        if self.algo_config.ema.enabled:
-            ema = EMAModel(model=nets, power=self.algo_config.ema.power)
-                
-        # set attrs
-        self.nets = nets
-        self.noise_scheduler = noise_scheduler
-        self.ema = ema
-        self.action_check_done = False
-        self.obs_queue = None
-        self.action_queue = None
+
+        self.nets.float().to(self.device)
+
+    def _create_base_policy(self):
+        """
+        Creates the base policy network. Using DP for base policy
+        """
+        assert self.algo_config.base_policy_ckpt_path is not None, "base_policy_ckpt_path is not set"
+        self.base_policy = DiffusionPolicyUNet(
+            algo_config=self.algo_config.base_policy,
+            obs_config=self.obs_config,
+            global_config=self.algo_config.base_policy,
+            obs_key_shapes=self.obs_key_shapes,
+            ac_dim=self.ac_dim,
+            device=self.device,
+        )
+        self.nets["base_policy"] = self.base_policy.nets
+        ckpt_dict = FileUtils.load_dict_from_checkpoint(ckpt_path=self.algo_config.base_policy_ckpt_path)
+        self.base_policy.deserialize(ckpt_dict["model"])
+
+    def _create_dsrl_policy(self):
+        """
+        Creates the dsrl policy network.
+        """
+        dsrl_policy_args = dict(
+            obs_shapes=self.obs_shapes,
+            goal_shapes=self.goal_shapes,
+            ac_dim=self.ac_dim * self.algo_config.base_policy.horizon.prediction_horizon,
+            mlp_layer_dims=self.algo_config.dsrl_policy.layer_dims,
+            encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
+        )
+        self.nets["dsrl_policy"] = PolicyNets.GaussianActorNetwork(**dsrl_policy_args)
+
+    def _create_base_critic(self):
+        """
+        Creates the base critic network.
+        """
+        critic_class = ValueNets.ActionValueNetwork
+        critic_args = dict(
+            obs_shapes=self.obs_shapes,
+            ac_dim=self.ac_dim * self.algo_config.base_policy.horizon.action_horizon,
+            mlp_layer_dims=self.algo_config.base_critic.layer_dims,
+            value_bounds=self.algo_config.base_critic.value_bounds,
+            goal_shapes=self.goal_shapes,
+            encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
+        )
+
+        # Q network ensemble and target ensemble
+        self.nets["base_critic"] = nn.ModuleList()
+        self.nets["base_critic_target"] = nn.ModuleList()
+        for _ in range(self.algo_config.base_critic.ensemble.n):
+            critic = critic_class(**critic_args)
+            self.nets["base_critic"].append(critic)
+
+            critic_target = critic_class(**critic_args)
+            self.nets["base_critic_target"].append(critic_target)
     
-    def process_batch_for_training(self, batch):
+    def _create_dsrl_critic(self):
         """
-        Processes input batch from a data loader to filter out
-        relevant information and prepare the batch for training.
+        Creates the dsrl critic network.
+        """
+        critic_class = ValueNets.ActionValueNetwork
+        critic_args = dict(
+            obs_shapes=self.obs_shapes,
+            ac_dim=self.ac_dim * self.algo_config.base_policy.horizon.prediction_horizon,
+            mlp_layer_dims=self.algo_config.dsrl_critic.layer_dims,
+            value_bounds=self.algo_config.dsrl_critic.value_bounds,
+            goal_shapes=self.goal_shapes,
+            encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
+        )
 
+        # Q network ensemble and target ensemble
+        self.nets["dsrl_critic"] = nn.ModuleList()
+        self.nets["dsrl_critic_target"] = nn.ModuleList()
+        for _ in range(self.algo_config.dsrl_critic.ensemble.n):
+            critic = critic_class(**critic_args)
+            self.nets["dsrl_critic"].append(critic)
+
+            critic_target = critic_class(**critic_args)
+            self.nets["dsrl_critic_target"].append(critic_target)
+
+    def _get_action_trajectory(self, obs_dict, goal_dict=None):
+        """
         Args:
-            batch (dict): dictionary with torch.Tensors sampled
-                from a data loader
+            obs_dict (dict): dictionary of observations
+                each obervation has N samples
+            goal_dict (dict): dictionary of goals
 
         Returns:
-            input_batch (dict): processed and filtered batch that
-                will be used for training 
+            action (torch.Tensor): action
         """
-        To = self.algo_config.horizon.observation_horizon
-        Ta = self.algo_config.horizon.action_horizon
-        Tp = self.algo_config.horizon.prediction_horizon
-
-        input_batch = dict()
-        input_batch["obs"] = {k: batch["obs"][k][:, :To, :] for k in batch["obs"]}
-        input_batch["goal_obs"] = batch.get("goal_obs", None) # goals may not be present
-        input_batch["actions"] = batch["actions"][:, :Tp, :]
-        
-        # check if actions are normalized to [-1,1]
-        if not self.action_check_done:
-            actions = input_batch["actions"]
-            in_range = (-1 <= actions) & (actions <= 1)
-            all_in_range = torch.all(in_range).item()
-            if not all_in_range:
-                raise ValueError("'actions' must be in range [-1,1] for Diffusion Policy! Check if hdf5_normalize_action is enabled.")
-            self.action_check_done = True
-        
-        return TensorUtils.to_device(TensorUtils.to_float(input_batch), self.device)
-        
-    def train_on_batch(self, batch, epoch, validate=False):
-        """
-        Training on a single batch of data.
-
-        Args:
-            batch (dict): dictionary with torch.Tensors sampled
-                from a data loader and filtered by @process_batch_for_training
-
-            epoch (int): epoch number - required by some Algos that need
-                to perform staged training and early stopping
-
-            validate (bool): if True, don't perform any learning updates.
-
-        Returns:
-            info (dict): dictionary of relevant inputs, outputs, and losses
-                that might be relevant for logging
-        """
-        To = self.algo_config.horizon.observation_horizon
-        Ta = self.algo_config.horizon.action_horizon
-        Tp = self.algo_config.horizon.prediction_horizon
-        action_dim = self.ac_dim
-        B = batch["actions"].shape[0]
-        
-        
-        with TorchUtils.maybe_no_grad(no_grad=validate):
-            info = super(DiffusionPolicyUNet, self).train_on_batch(batch, epoch, validate=validate)
-            actions = batch["actions"]
-            
-            # encode obs
-            inputs = {
-                "obs": batch["obs"],
-                "goal": batch["goal_obs"]
-            }
-            for k in self.obs_shapes:
-                # first two dimensions should be [B, T] for inputs
-                assert inputs["obs"][k].ndim - 2 == len(self.obs_shapes[k])
-            
-            obs_features = TensorUtils.time_distributed(inputs, self.nets["policy"]["obs_encoder"], inputs_as_kwargs=True)
-            assert obs_features.ndim == 3  # [B, T, D]
-
-            obs_cond = obs_features.flatten(start_dim=1)
-            
-            # sample noise to add to actions
-            noise = torch.randn(actions.shape, device=self.device)
-            
-            # sample a diffusion iteration for each data point
-            timesteps = torch.randint(
-                0, self.noise_scheduler.config.num_train_timesteps, 
-                (B,), device=self.device
-            ).long()
-            
-            # add noise to the clean actions according to the noise magnitude at each diffusion iteration
-            # (this is the forward diffusion process)
-            noisy_actions = self.noise_scheduler.add_noise(
-                actions, noise, timesteps)
-            
-            # predict the noise residual
-            noise_pred = self.nets["policy"]["noise_pred_net"](
-                noisy_actions, timesteps, global_cond=obs_cond)
-            
-            # L2 loss
-            loss = F.mse_loss(noise_pred, noise)
-            
-            # logging
-            losses = {
-                "l2_loss": loss
-            }
-            info["losses"] = TensorUtils.detach(losses)
-
-            if not validate:
-                # gradient step
-                policy_grad_norms = TorchUtils.backprop_for_loss(
-                    net=self.nets,
-                    optim=self.optimizers["policy"],
-                    loss=loss,
-                )
-                
-                # update Exponential Moving Average of the model weights
-                if self.ema is not None:
-                    self.ema.step(self.nets)
-                
-                step_info = {
-                    "policy_grad_norms": policy_grad_norms
-                }
-                info.update(step_info)
-
-        return info
-    
-    def log_info(self, info):
-        """
-        Process info dictionary from @train_on_batch to summarize
-        information to pass to tensorboard for logging.
-
-        Args:
-            info (dict): dictionary of info
-
-        Returns:
-            loss_log (dict): name -> summary statistic
-        """
-        log = super(DiffusionPolicyUNet, self).log_info(info)
-        log["Loss"] = info["losses"]["l2_loss"].item()
-        if "policy_grad_norms" in info:
-            log["Policy_Grad_Norms"] = info["policy_grad_norms"]
-        return log
+        noisy_action = self.nets["dsrl_policy"](obs_dict, goal_dict) # [N, ac_dim * prediction_horizon]
+        noisy_action = noisy_action.reshape(-1, self.algo_config.base_policy.horizon.prediction_horizon, self.ac_dim) # [N, prediction_horizon, ac_dim]
+        action = self.base_policy._get_action_trajectory(obs_dict, goal_dict, noisy_action) # [N, prediction_horizon, ac_dim]
+        return action
     
     def reset(self):
         """
@@ -269,7 +197,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         action_queue = deque(maxlen=Ta)
         self.obs_queue = obs_queue
         self.action_queue = action_queue
-    
+
     def get_action(self, obs_dict, goal_dict=None):
         """
         Get policy action outputs.
@@ -282,8 +210,8 @@ class DiffusionPolicyUNet(PolicyAlgo):
             action (torch.Tensor): action tensor [1, Da]
         """
         # obs_dict: key: [1,D]
-        To = self.algo_config.horizon.observation_horizon
-        Ta = self.algo_config.horizon.action_horizon
+        To = self.algo_config.base_policy.horizon.observation_horizon
+        Ta = self.algo_config.base_policy.horizon.action_horizon
 
         # TODO: obs_queue already handled by frame_stack
         # make sure we have at least To observations in obs_queue
@@ -313,161 +241,190 @@ class DiffusionPolicyUNet(PolicyAlgo):
         # [1,Da]
         action = action.unsqueeze(0)
         return action
+
+    def train_one_epoch(self, epoch, validate=False):
+        self.set_train()
+        with TorchUtils.maybe_no_grad(no_grad=validate):
+            info = PolicyAlgo.train_on_batch(self, None, epoch, validate=validate) # simple checking
+
+            ########################
+            # Train critic
+            # Sample actions and use bellman backup to train critic
+            # Iterate G times
+            ########################
+            print("Training base critic")
+            for _ in LogUtils.custom_tqdm(range(self.global_config.train.n_iter.base_critic)):
+                mini_batch = self.replay_buffer.sample_mini_batch(
+                    self.global_config.train.batch_size,
+                    self.device
+                )
+                critic_info = self._train_base_critic_on_batch(
+                    batch=mini_batch, 
+                    epoch=epoch, 
+                    no_backprop=validate,
+                )
+                info.update(critic_info)
+
+            print("Training dsrl critic")
+            for _ in LogUtils.custom_tqdm(range(self.global_config.train.n_iter.dsrl_critic)):
+                mini_batch = self.replay_buffer.sample_mini_batch(
+                    self.global_config.train.batch_size,
+                    self.device
+                )
+                critic_info = self._train_dsrl_critic_on_batch(
+                    batch=mini_batch, 
+                    epoch=epoch, 
+                    no_backprop=validate,
+                )
+                info.update(critic_info)
+
+            print("Training dsrl policy")
+            for _ in LogUtils.custom_tqdm(range(self.global_config.train.n_iter.dsrl_policy)):
+                mini_batch = self.replay_buffer.sample_mini_batch(
+                    self.global_config.train.batch_size,
+                    self.device
+                )
+                policy_info = self._train_dsrl_policy_on_batch(
+                    batch=mini_batch, 
+                    epoch=epoch, 
+                    no_backprop=validate,
+                )
+                info.update(policy_info)
+
+            return info
         
-    def _get_action_trajectory(self, obs_dict, goal_dict=None):
-        assert not self.nets.training
-        To = self.algo_config.horizon.observation_horizon
-        Ta = self.algo_config.horizon.action_horizon
-        Tp = self.algo_config.horizon.prediction_horizon
-        action_dim = self.ac_dim
-        if self.algo_config.ddpm.enabled is True:
-            num_inference_timesteps = self.algo_config.ddpm.num_inference_timesteps
-        elif self.algo_config.ddim.enabled is True:
-            num_inference_timesteps = self.algo_config.ddim.num_inference_timesteps
-        else:
-            raise ValueError
-        
-        # select network
-        nets = self.nets
-        if self.ema is not None:
-            nets = self.ema.averaged_model
-        
-        # encode obs
-        inputs = {
-            "obs": obs_dict,
-            "goal": goal_dict
-        }
-        for k in self.obs_shapes:
-            # first two dimensions should be [B, T] for inputs
-            assert inputs["obs"][k].ndim - 2 == len(self.obs_shapes[k])
-        obs_features = TensorUtils.time_distributed(inputs, nets["policy"]["obs_encoder"], inputs_as_kwargs=True)
-        assert obs_features.ndim == 3  # [B, T, D]
-        B = obs_features.shape[0]
-
-        # reshape observation to (B,obs_horizon*obs_dim)
-        obs_cond = obs_features.flatten(start_dim=1)
-
-        # initialize action from Guassian noise
-        noisy_action = torch.randn(
-            (B, Tp, action_dim), device=self.device)
-        naction = noisy_action
-        
-        # init scheduler
-        self.noise_scheduler.set_timesteps(num_inference_timesteps)
-
-        for k in self.noise_scheduler.timesteps:
-            # predict noise
-            noise_pred = nets["policy"]["noise_pred_net"](
-                sample=naction, 
-                timestep=k,
-                global_cond=obs_cond
-            )
-
-            # inverse diffusion step (remove noise)
-            naction = self.noise_scheduler.step(
-                model_output=noise_pred,
-                timestep=k,
-                sample=naction
-            ).prev_sample
-
-        # process action using Ta
-        start = To - 1
-        end = start + Ta
-        action = naction[:,start:end]
-        return action
-
-    def serialize(self):
+    def _get_base_critic_target_q_values(self, obs_dict, action, goal_dict):
         """
-        Get dictionary of current model parameters.
-        """
-        return {
-            "nets": self.nets.state_dict(),
-            "optimizers": { k : self.optimizers[k].state_dict() for k in self.optimizers },
-            "lr_schedulers": { k : self.lr_schedulers[k].state_dict() if self.lr_schedulers[k] is not None else None for k in self.lr_schedulers },
-            "ema": self.ema.averaged_model.state_dict() if self.ema is not None else None,
-        }
-
-    def deserialize(self, model_dict, load_optimizers=False):
-        """
-        Load model from a checkpoint.
+        Helper function to get Q-values for a given observation and action.
 
         Args:
-            model_dict (dict): a dictionary saved by self.serialize() that contains
-                the same keys as @self.network_classes
-            load_optimizers (bool): whether to load optimizers and lr_schedulers from the model_dict;
-                used when resuming training from a checkpoint
+            obs_dict (dict): dictionary of (N, Do) sized obervations
+            action (torch.Tensor): (N, ac_dim) sized action
+            goal_dict (dict): dictionary of (N, Dg) sized goals
+
+        Returns:
+            q_values (torch.Tensor): (N, ) sized Q-values
+        TODO: Make this parallelized
         """
-        self.nets.load_state_dict(model_dict["nets"])
+        with torch.no_grad():
+            q_values = torch.cat([
+                target_critic(obs_dict, action, goal_dict)
+                for target_critic in self.nets["base_critic_target"]
+            ], dim=1)
+            return q_values.min(dim=1).values.unsqueeze(1)
+        
+    def _get_dsrl_critic_target_q_values(self, obs_dict, action, goal_dict):
+        """
+        Helper function to get Q-values for a given observation and action.
+        """
+        q_values = torch.cat([
+            target_critic(obs_dict, action, goal_dict)
+            for target_critic in self.nets["dsrl_critic_target"]
+        ], dim=1)
+        return q_values.min(dim=1).values.unsqueeze(1)
+        
+    def _train_base_critic_on_batch(self, batch, epoch, no_backprop=False):
+        info = OrderedDict()
 
-        # for backwards compatibility
-        if "optimizers" not in model_dict:
-            model_dict["optimizers"] = {}
-        if "lr_schedulers" not in model_dict:
-            model_dict["lr_schedulers"] = {}
+        obs = batch["obs"]
+        actions = batch["actions"]
+        rewards = batch["rewards"]
+        dones = batch["dones"]
+        next_obs = batch["next_obs"]
 
-        if model_dict.get("ema", None) is not None:
-            self.ema.averaged_model.load_state_dict(model_dict["ema"])
+        pred_qs = [critic(obs_dict=obs, acts=actions, goal_dict=None) for critic in self.nets["base_critic"]]
 
-        if load_optimizers:
-            for k in model_dict["optimizers"]:
-                self.optimizers[k].load_state_dict(model_dict["optimizers"][k])
-            for k in model_dict["lr_schedulers"]:
-                if model_dict["lr_schedulers"][k] is not None:
-                    self.lr_schedulers[k].load_state_dict(model_dict["lr_schedulers"][k])
+        next_actions = self._get_action_trajectory(next_obs)
+        next_pred_q = self._get_base_critic_target_q_values(next_obs, next_actions, None)
+        target_q = rewards + self.global_config.train.discount_factor * (1 - dones) * next_pred_q
 
+        base_critic_losses = []
+        loss_fn = nn.SmoothL1Loss() if self.algo_config.base_critic.use_huber else nn.MSELoss()
+        for i, pred_q in enumerate(pred_qs):
+            loss = loss_fn(pred_q, target_q)
+            info[f"base_critic/loss_{i}"] = loss
+            base_critic_losses.append(loss)
+        
+        if not no_backprop:
+            for (base_critic_loss, base_critic, base_critic_target, optimizer) in zip(
+                base_critic_losses, self.nets["base_critic"], self.nets["base_critic_target"], self.optimizers["base_critic"]
+            ):
+                TorchUtils.backprop_for_loss(
+                    net=base_critic,
+                    optim=optimizer,
+                    loss=base_critic_loss,
+                    max_grad_norm=self.algo_config.base_critic.max_gradient_norm,
+                    retain_graph=False,
+                )
+                with torch.no_grad():
+                    TorchUtils.soft_update(source=base_critic, target=base_critic_target, tau=self.algo_config.base_critic.target_tau)
 
-def replace_submodules(
-        root_module: nn.Module, 
-        predicate: Callable[[nn.Module], bool], 
-        func: Callable[[nn.Module], nn.Module]) -> nn.Module:
-    """
-    Replace all submodules selected by the predicate with
-    the output of func.
+        return info
 
-    predicate: Return true if the module is to be replaced.
-    func: Return new module to use.
-    """
-    if predicate(root_module):
-        return func(root_module)
+    def _train_dsrl_critic_on_batch(self, batch, epoch, no_backprop=False):
+        info = OrderedDict()
 
-    if parse_version(torch.__version__) < parse_version("1.9.0"):
-        raise ImportError("This function requires pytorch >= 1.9.0")
+        obs = batch["obs"]
+        actions = batch["actions"]
+        rewards = batch["rewards"]
+        dones = batch["dones"]
+        next_obs = batch["next_obs"]
 
-    bn_list = [k.split(".") for k, m 
-        in root_module.named_modules(remove_duplicate=True) 
-        if predicate(m)]
-    for *parent, k in bn_list:
-        parent_module = root_module
-        if len(parent) > 0:
-            parent_module = root_module.get_submodule(".".join(parent))
-        if isinstance(parent_module, nn.Sequential):
-            src_module = parent_module[int(k)]
-        else:
-            src_module = getattr(parent_module, k)
-        tgt_module = func(src_module)
-        if isinstance(parent_module, nn.Sequential):
-            parent_module[int(k)] = tgt_module
-        else:
-            setattr(parent_module, k, tgt_module)
-    # verify that all modules are replaced
-    bn_list = [k.split(".") for k, m 
-        in root_module.named_modules(remove_duplicate=True) 
-        if predicate(m)]
-    assert len(bn_list) == 0
-    return root_module
+        B = actions.shape[0]
+        Tp = self.algo_config.base_policy.horizon.prediction_horizon
+        Ta = self.algo_config.base_policy.horizon.action_horizon
+        action_dim = self.ac_dim
 
+        noisy_actions = torch.randn(
+            (B, Tp, action_dim), device=self.device)
+        
+        actions = self.base_policy._get_action_trajectory(obs, None, noisy_actions)
+        dsrl_qs = [critic(obs_dict=obs, acts=noisy_actions, goal_dict=None) for critic in self.nets["dsrl_critic"]]
+        base_qs = [critic(obs_dict=obs, acts=actions, goal_dict=None) for critic in self.nets["base_critic"]]
 
-def replace_bn_with_gn(
-    root_module: nn.Module, 
-    features_per_group: int=16) -> nn.Module:
-    """
-    Relace all BatchNorm layers with GroupNorm.
-    """
-    replace_submodules(
-        root_module=root_module,
-        predicate=lambda x: isinstance(x, nn.BatchNorm2d),
-        func=lambda x: nn.GroupNorm(
-            num_groups=x.num_features//features_per_group, 
-            num_channels=x.num_features)
-    )
-    return root_module
+        dsrl_q_losses = []
+        loss_fn = nn.SmoothL1Loss() if self.algo_config.dsrl_critic.use_huber else nn.MSELoss()
+        for i, (dsrl_q, base_q) in enumerate(zip(dsrl_qs, base_qs)):
+            loss = loss_fn(dsrl_q, base_q)
+            info[f"dsrl_critic/loss_{i}"] = loss
+            dsrl_q_losses.append(loss)
+
+        if not no_backprop:
+            for (dsrl_q_loss, dsrl_critic, dsrl_critic_target, optimizer) in zip(
+                dsrl_q_losses, self.nets["dsrl_critic"], self.nets["dsrl_critic_target"], self.optimizers["dsrl_critic"]
+            ):
+                TorchUtils.backprop_for_loss(
+                    net=dsrl_critic,
+                    optim=optimizer,
+                    loss=dsrl_q_loss,
+                    max_grad_norm=self.algo_config.dsrl_critic.max_gradient_norm,
+                    retain_graph=False,
+                )
+                with torch.no_grad():
+                    TorchUtils.soft_update(source=dsrl_critic, target=dsrl_critic_target, tau=self.algo_config.dsrl_critic.target_tau)
+
+        return info
+
+    def _train_dsrl_policy_on_batch(self, batch, epoch, no_backprop=False):
+        info = OrderedDict()
+
+        obs = batch["obs"]
+
+        noisy_actions_dist = self.nets["dsrl_policy"].forward_train(obs, goal_dict=None)
+        noisy_actions = noisy_actions_dist.rsample()
+
+        dsrl_qs = self._get_dsrl_critic_target_q_values(obs, noisy_actions, None)
+        dsrl_loss = -dsrl_qs.mean()
+        info["dsrl_policy/loss"] = dsrl_loss
+        info["dsrl_policy/q_pred"] = dsrl_qs.mean()
+
+        if not no_backprop:
+            TorchUtils.backprop_for_loss(
+                net=self.nets["dsrl_policy"],
+                optim=self.optimizers["dsrl_policy"],
+                loss=dsrl_loss,
+                max_grad_norm=self.algo_config.dsrl_policy.max_gradient_norm,
+                retain_graph=False,
+            )
+        
+        return info

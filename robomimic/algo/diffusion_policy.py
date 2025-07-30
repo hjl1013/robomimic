@@ -314,7 +314,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         action = action.unsqueeze(0)
         return action
         
-    def _get_action_trajectory(self, obs_dict, goal_dict=None):
+    def _get_action_trajectory(self, obs_dict, goal_dict=None, noisy_action=None):
         # assert not self.nets.training
         To = self.algo_config.horizon.observation_horizon
         Ta = self.algo_config.horizon.action_horizon
@@ -348,8 +348,9 @@ class DiffusionPolicyUNet(PolicyAlgo):
         obs_cond = obs_features.flatten(start_dim=1)
 
         # initialize action from Guassian noise
-        noisy_action = torch.randn(
-            (B, Tp, action_dim), device=self.device)
+        if noisy_action is None:
+            noisy_action = torch.randn(
+                (B, Tp, action_dim), device=self.device)
         naction = noisy_action
         
         # init scheduler

@@ -56,7 +56,7 @@ class Expo(PolicyAlgo, ValueAlgo):
         self._create_base_policy()
         self._create_edit_policy()
         self._create_critic()
-        
+
         with torch.no_grad():
             TorchUtils.hard_update(
                 source=self.nets["critic"], 

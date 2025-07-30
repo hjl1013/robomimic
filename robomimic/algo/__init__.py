@@ -11,3 +11,4 @@ from robomimic.algo.iris import IRIS
 from robomimic.algo.td3_bc import TD3_BC
 from robomimic.algo.diffusion_policy import DiffusionPolicyUNet
 from robomimic.algo.expo import Expo
+from robomimic.algo.dsrl import DSRL

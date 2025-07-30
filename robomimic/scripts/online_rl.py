@@ -268,12 +268,12 @@ def train(config, device, resume=False):
                 camera_names=["agentview", "robot0_eye_in_hand"]
             )
 
-            model.replay_buffer.batched_insert(
+            model.replay_buffer.insert_trajectory(
                 obs={obs_key: torch.from_numpy(traj["obs"][obs_key]).float() for obs_key in traj["obs"]},
-                action=torch.from_numpy(traj["actions"]).float(),
-                reward=torch.from_numpy(traj["rewards"]).float()[:, None],
+                actions=torch.from_numpy(traj["actions"]).float(),
+                rewards=torch.from_numpy(traj["rewards"]).float()[:, None],
                 next_obs={obs_key: torch.from_numpy(traj["next_obs"][obs_key]).float() for obs_key in traj["next_obs"]},
-                done=torch.from_numpy(traj["dones"]).float()[:, None],
+                dones=torch.from_numpy(traj["dones"]).float()[:, None],
             )
         
         # Update model
