@@ -121,7 +121,7 @@ class DSRL(PolicyAlgo, ValueAlgo):
             mlp_layer_dims=self.algo_config.dsrl_policy.layer_dims,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
         )
-        self.nets["dsrl_policy"] = PolicyNets.GaussianActorNetwork(**dsrl_policy_args)
+        self.nets["dsrl_policy"] = PolicyNets.GMMActorNetwork(**dsrl_policy_args)
 
     def _create_base_critic(self):
         """
