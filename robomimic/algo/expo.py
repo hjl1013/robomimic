@@ -50,6 +50,32 @@ class Expo(PolicyAlgo, ValueAlgo):
             action_dim=self.ac_dim,
         )
 
+    def _create_shapes(self, obs_keys, obs_key_shapes):
+        """
+        Create obs_shapes, goal_shapes, and subgoal_shapes dictionaries, to make it
+        easy for this algorithm object to keep track of observation key shapes. Each dictionary
+        maps observation key to shape.
+
+        Args:
+            obs_keys (dict): dict of required observation keys for this training run (usually
+                specified by the obs config), e.g., {"obs": ["rgb", "proprio"], "goal": ["proprio"]}
+            obs_key_shapes (dict): dict of observation key shapes, e.g., {"rgb": [3, 224, 224]}
+        """
+        # determine shapes
+        self.obs_shapes = OrderedDict()
+        self.goal_shapes = OrderedDict()
+        self.subgoal_shapes = OrderedDict()
+
+        # We check across all modality groups (obs, goal, subgoal), and see if the inputted observation key exists
+        # across all modalitie specified in the config. If so, we store its corresponding shape internally
+        for k in obs_key_shapes:
+            if "obs" in self.obs_config.modalities and k in [obs_key for modality in self.obs_config.modalities.obs.values() for obs_key in modality]:
+                self.obs_shapes[k] = [self.algo_config.base_policy.horizon.observation_horizon, *obs_key_shapes[k]]
+            if "goal" in self.obs_config.modalities and k in [obs_key for modality in self.obs_config.modalities.goal.values() for obs_key in modality]:
+                self.goal_shapes[k] = obs_key_shapes[k]
+            if "subgoal" in self.obs_config.modalities and k in [obs_key for modality in self.obs_config.modalities.subgoal.values() for obs_key in modality]:
+                self.subgoal_shapes[k] = obs_key_shapes[k]
+
     def _create_networks(self):
         """
         Creates networks and places them into @self.nets.
@@ -194,8 +220,6 @@ class Expo(PolicyAlgo, ValueAlgo):
         
         # sample action edits
         edit_policy_obs_dict = copy.deepcopy(duplicated_obs_dict)
-        if self.global_config.train.frame_stack > 1:
-            edit_policy_obs_dict = {obs_key: duplicated_obs_dict[obs_key][:, -1, :] for obs_key in duplicated_obs_dict} # action edit doesn't use frame stack
         edit_policy_obs_dict["base_action"] = base_actions
         edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) # [N * sample_num, ac_dim]
 
@@ -232,8 +256,6 @@ class Expo(PolicyAlgo, ValueAlgo):
         
         # sample action edits
         edit_policy_obs_dict = copy.deepcopy(duplicated_obs_dict)
-        if self.global_config.train.frame_stack > 1:
-            edit_policy_obs_dict = {obs_key: duplicated_obs_dict[obs_key][:, -1, :] for obs_key in duplicated_obs_dict} # action edit doesn't use frame stack
         edit_policy_obs_dict["base_action"] = base_actions
         edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) # [N * sample_num, ac_dim]
 
@@ -304,18 +326,13 @@ class Expo(PolicyAlgo, ValueAlgo):
         rewards = batch["rewards"]
         dones = batch["dones"]
 
-        # reshape obs and next_obs if frame_stack is greater than 1
-        if self.global_config.train.frame_stack > 1:
-            unstacked_obs = {obs_key: obs[obs_key][:, -1, :] for obs_key in obs}
-            unstacked_next_obs = {obs_key: next_obs[obs_key][:, -1, :] for obs_key in next_obs}
-
         # Q predictions
-        pred_qs = [critic(obs_dict=unstacked_obs, acts=actions, goal_dict=None)
+        pred_qs = [critic(obs_dict=obs, acts=actions, goal_dict=None)
                    for critic in self.nets["critic"]]
 
         # target Q value
         next_actions = self.get_action(next_obs)
-        target_qs = self._get_target_q_values(unstacked_next_obs, next_actions, None)
+        target_qs = self._get_target_q_values(obs, next_actions, None)
         q_target = rewards + self.global_config.train.discount_factor * (1 - dones) * target_qs
         q_target = q_target.detach()
 
@@ -368,16 +385,12 @@ class Expo(PolicyAlgo, ValueAlgo):
         # get batch values
         obs = batch["obs"]
 
-        # reshape obs and next_obs if frame_stack is greater than 1
-        if self.global_config.train.frame_stack > 1:
-            unstacked_obs = {obs_key: obs[obs_key][:, -1, :] for obs_key in obs}
-
         # calculate actions
         base_actions, _ = self.get_base_edit_action(obs, None)
         base_actions = base_actions.detach()
 
         # 1. prepare edit_policy input
-        edit_policy_obs_dict = copy.deepcopy(unstacked_obs)  # s
+        edit_policy_obs_dict = copy.deepcopy(obs)  # s
         edit_policy_obs_dict["base_action"] = base_actions   # a
 
         # 2. sample edit actions (a_hat) and get distribution
@@ -387,7 +400,7 @@ class Expo(PolicyAlgo, ValueAlgo):
 
         # 3. evaluate Q(s, a + a_hat)
         combined_action = base_actions + a_hat
-        q_pred = self._get_q_values(unstacked_obs, combined_action, goal_dict=None)  # shape [B, 1]
+        q_pred = self._get_q_values(obs, combined_action, goal_dict=None)  # shape [B, 1]
 
         # 4. compute loss
         alpha = self.algo_config.edit_policy.entropy_weight  # entropy regularization
