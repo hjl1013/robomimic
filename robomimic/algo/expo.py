@@ -45,7 +45,8 @@ class Expo(PolicyAlgo, ValueAlgo):
         self.replay_buffer = ReplayBuffer(
             capacity=self.algo_config.replay_buffer.capacity,
             obs_key_shapes=self.obs_key_shapes,
-            frame_stack=self.global_config.train.frame_stack,
+            observation_horizon=self.algo_config.base_policy.horizon.observation_horizon,
+            action_horizon=self.algo_config.base_policy.horizon.action_horizon,
             action_dim=self.ac_dim,
         )
 
