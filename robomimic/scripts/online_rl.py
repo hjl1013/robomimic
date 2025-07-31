@@ -256,8 +256,9 @@ def train(config, device, resume=False):
             action_normalization_stats=action_normalization_stats,
         )
 
-        num_episodes = config.train.online_rollout_collection.n
         print("Collecting rollouts")
+        num_episodes = config.train.online_rollout_collection.n
+        success_count = 0
         for _ in LogUtils.custom_tqdm(range(num_episodes)):
             stats, traj = rollout(
                 policy=rollout_model,
@@ -267,6 +268,7 @@ def train(config, device, resume=False):
                 return_obs=True,
                 camera_names=["agentview", "robot0_eye_in_hand"]
             )
+            success_count += stats["Success_Rate"]
 
             model.replay_buffer.insert_trajectory(
                 obs={obs_key: torch.from_numpy(traj["obs"][obs_key]).float() for obs_key in traj["obs"]},
@@ -275,9 +277,12 @@ def train(config, device, resume=False):
                 next_obs={obs_key: torch.from_numpy(traj["next_obs"][obs_key]).float() for obs_key in traj["next_obs"]},
                 dones=torch.from_numpy(traj["dones"]).float()[:, None],
             )
-        
+        success_rate = success_count / num_episodes
+        print(f"Online rollout success rate: {success_rate}")
+
         # Update model
         step_log = model.train_one_epoch(epoch, validate=False)
+        step_log["online_rollout/success_rate"] = success_rate
 
         # setup checkpoint path
         epoch_ckpt_name = "model_epoch_{}".format(epoch)
