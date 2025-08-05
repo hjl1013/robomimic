@@ -120,8 +120,10 @@ class DSRL(PolicyAlgo, ValueAlgo):
             ac_dim=self.ac_dim * self.algo_config.base_policy.horizon.prediction_horizon,
             mlp_layer_dims=self.algo_config.dsrl_policy.layer_dims,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
+            use_tanh=True,
         )
-        self.nets["dsrl_policy"] = PolicyNets.GMMActorNetwork(**dsrl_policy_args)
+        self.nets["dsrl_policy"] = PolicyNets.GaussianActorNetwork(**dsrl_policy_args)
+        self.dsrl_policy_beta = self.algo_config.dsrl_policy.beta
 
     def _create_base_critic(self):
         """
@@ -181,7 +183,7 @@ class DSRL(PolicyAlgo, ValueAlgo):
         Returns:
             action (torch.Tensor): action
         """
-        noisy_action = self.nets["dsrl_policy"](obs_dict, goal_dict) # [N, ac_dim * prediction_horizon]
+        noisy_action = self.nets["dsrl_policy"](obs_dict, goal_dict) * self.dsrl_policy_beta # [N, ac_dim * prediction_horizon]
         noisy_action = noisy_action.reshape(-1, self.algo_config.base_policy.horizon.prediction_horizon, self.ac_dim) # [N, prediction_horizon, ac_dim]
         action = self.base_policy._get_action_trajectory(obs_dict, goal_dict, noisy_action) # [N, prediction_horizon, ac_dim]
         return action
@@ -411,7 +413,7 @@ class DSRL(PolicyAlgo, ValueAlgo):
         obs = batch["obs"]
 
         noisy_actions_dist = self.nets["dsrl_policy"].forward_train(obs, goal_dict=None)
-        noisy_actions = noisy_actions_dist.rsample()
+        noisy_actions = noisy_actions_dist.rsample() * self.dsrl_policy_beta
 
         dsrl_qs = self._get_dsrl_critic_target_q_values(obs, noisy_actions, None)
         dsrl_loss = -dsrl_qs.mean()

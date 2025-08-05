@@ -130,9 +130,11 @@ class Expo(PolicyAlgo, ValueAlgo):
             ac_dim=self.ac_dim,
             mlp_layer_dims=self.algo_config.edit_policy.layer_dims,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
+            use_tanh=True,
         )
 
         self.nets["edit_policy"] = edit_policy_class(**edit_policy_args)
+        self.edit_policy_beta = self.algo_config.edit_policy.beta
     
     def _create_critic(self):
         """
@@ -169,7 +171,6 @@ class Expo(PolicyAlgo, ValueAlgo):
 
         Returns:
             q_values (torch.Tensor): (N, ) sized Q-values
-        TODO: Make this parallelized
         """
         with torch.no_grad():
             q_values = torch.cat([
@@ -221,7 +222,7 @@ class Expo(PolicyAlgo, ValueAlgo):
         # sample action edits
         edit_policy_obs_dict = copy.deepcopy(duplicated_obs_dict)
         edit_policy_obs_dict["base_action"] = base_actions
-        edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) # [N * sample_num, ac_dim]
+        edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) * self.edit_policy_beta # [N * sample_num, ac_dim]
 
         # combine base actions and action edits
         action_samples = base_actions + edit_actions # [N * sample_num, ac_dim]
@@ -257,7 +258,7 @@ class Expo(PolicyAlgo, ValueAlgo):
         # sample action edits
         edit_policy_obs_dict = copy.deepcopy(duplicated_obs_dict)
         edit_policy_obs_dict["base_action"] = base_actions
-        edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) # [N * sample_num, ac_dim]
+        edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) * self.edit_policy_beta # [N * sample_num, ac_dim]
 
         # combine base actions and action edits and calculate q-values
         action_samples = base_actions + edit_actions # [N * sample_num, ac_dim]
@@ -395,7 +396,7 @@ class Expo(PolicyAlgo, ValueAlgo):
 
         # 2. sample edit actions (a_hat) and get distribution
         dist = self.nets["edit_policy"].forward_train(edit_policy_obs_dict, goal_dict=None)
-        a_hat = dist.rsample()  # reparameterized sampling
+        a_hat = dist.rsample() * self.edit_policy_beta  # reparameterized sampling
         log_prob = dist.log_prob(a_hat)  # shape [B,]
 
         # 3. evaluate Q(s, a + a_hat)
