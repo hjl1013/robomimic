@@ -226,7 +226,7 @@ def playback_dataset(args):
         ObsUtils.initialize_obs_utils_with_obs_specs(obs_modality_specs=dummy_spec)
 
         env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=args.dataset)
-        # env_meta["env_kwargs"]["controller_configs"]["control_delta"] = False # absolute action space
+        env_meta["env_kwargs"]["controller_configs"]["control_delta"] = False # absolute action space
         env = EnvUtils.create_env_from_metadata(env_meta=env_meta, render=args.render, render_offscreen=write_video)
 
         # some operations for playback are robosuite-specific, so determine if this environment is a robosuite env
@@ -300,8 +300,8 @@ def playback_dataset(args):
         # supply actions if using open-loop action playback
         actions = None
         if args.use_actions:
-            actions = f["data/{}/actions".format(ep)][()]
-            # actions = f["data/{}/actions_abs".format(ep)][()] # absolute actions
+            # actions = f["data/{}/actions".format(ep)][()]
+            actions = f["data/{}/actions_abs".format(ep)][()] # absolute actions
 
         playback_trajectory_with_env(
             env=env, 
