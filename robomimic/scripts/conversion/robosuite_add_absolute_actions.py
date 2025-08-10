@@ -56,7 +56,7 @@ class RobomimicAbsoluteActionConverter:
         #     abs_env_meta['env_kwargs']['controller_configs']['control_delta'] = False
         # else:
         #     abs_env_meta['env_kwargs']['controller_configs']['body_parts']['right']['control_delta'] = False
-        abs_env_meta['env_kwargs']['controller_configs']['control_delta'] = False
+        abs_env_meta['env_kwargs']['controller_configs']['input_type'] = 'absolute'
 
         env = EnvUtils.create_env_from_metadata(
             env_meta=env_meta,
@@ -168,7 +168,6 @@ def worker(x):
     path, demo_key = x
     converter = RobomimicAbsoluteActionConverter(path)
     abs_actions = converter.convert_demo(demo_key)
-    converter.file.close()
     info = dict()
     return abs_actions, info
 
