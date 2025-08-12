@@ -148,6 +148,13 @@ class DSRL(PolicyAlgo, ValueAlgo):
 
             critic_target = critic_class(**critic_args)
             self.nets["base_critic_target"].append(critic_target)
+
+        # Note: we optimize the log of the entropy coeff which is slightly different from the paper
+        # as discussed in https://github.com/rail-berkeley/softlearning/issues/37
+        init_value = 1.0
+        self.log_ent_coef = torch.log(torch.ones(1, device=self.device) * init_value).requires_grad_(True)
+        self.ent_coef_optimizer = torch.optim.Adam([self.log_ent_coef], lr=0.001)
+        self.target_entropy = 0.0
     
     def _create_dsrl_critic(self):
         """
@@ -306,14 +313,12 @@ class DSRL(PolicyAlgo, ValueAlgo):
 
         Returns:
             q_values (torch.Tensor): (N, ) sized Q-values
-        TODO: Make this parallelized
         """
-        with torch.no_grad():
-            q_values = torch.cat([
-                target_critic(obs_dict, action, goal_dict)
-                for target_critic in self.nets["base_critic_target"]
-            ], dim=1)
-            return q_values.min(dim=1).values.unsqueeze(1)
+        q_values = torch.cat([
+            target_critic(obs_dict, action, goal_dict)
+            for target_critic in self.nets["base_critic_target"]
+        ], dim=1)
+        return q_values.min(dim=1).values.unsqueeze(1)
         
     def _get_dsrl_critic_target_q_values(self, obs_dict, action, goal_dict):
         """
@@ -324,6 +329,21 @@ class DSRL(PolicyAlgo, ValueAlgo):
             for target_critic in self.nets["dsrl_critic_target"]
         ], dim=1)
         return q_values.min(dim=1).values.unsqueeze(1)
+    
+    def _update_entropy_coefficient_on_batch(self, batch, no_backprop=False):
+        obs = batch["obs"]
+
+        action_pred_dist = self.nets["dsrl_policy"].forward_train(obs, goal_dict=None)
+        action_pred_samples = action_pred_dist.rsample()
+        action_pred_log_probs = action_pred_dist.log_prob(action_pred_samples)
+        action_pred_samples = action_pred_samples * self.dsrl_policy_beta
+        ent_coeff = torch.exp(self.log_ent_coef.detach())
+        ent_coeff_loss = -(self.log_ent_coef * (action_pred_log_probs + self.target_entropy).detach()).mean()
+        if not no_backprop:
+            self.ent_coef_optimizer.zero_grad()
+            ent_coeff_loss.backward()
+            self.ent_coef_optimizer.step()
+        return ent_coeff, ent_coeff_loss
         
     def _train_base_critic_on_batch(self, batch, epoch, no_backprop=False):
         info = OrderedDict()
@@ -334,11 +354,25 @@ class DSRL(PolicyAlgo, ValueAlgo):
         dones = batch["dones"]
         next_obs = batch["next_obs"]
 
+        # Update entropy coefficient
+        ent_coeff, ent_coeff_loss = self._update_entropy_coefficient_on_batch(batch, no_backprop)
+        info["base_critic/ent_coeff"] = ent_coeff
+        info["base_critic/ent_coeff_loss"] = ent_coeff_loss
+
         pred_qs = [critic(obs_dict=obs, acts=actions, goal_dict=None) for critic in self.nets["base_critic"]]
 
-        next_actions = self._get_action_trajectory(next_obs)
-        next_pred_q = self._get_base_critic_target_q_values(next_obs, next_actions, None)
-        target_q = rewards + self.global_config.train.discount_factor * (1 - dones) * next_pred_q
+        with torch.no_grad():
+            next_noise_dist = self.nets["dsrl_policy"].forward_train(next_obs, goal_dict=None)
+            next_noise_samples = next_noise_dist.rsample()
+            next_noise_log_probs = next_noise_dist.log_prob(next_noise_samples).unsqueeze(1)
+            next_noise_samples = next_noise_samples * self.dsrl_policy_beta
+            next_noise_samples = next_noise_samples.reshape(-1, self.algo_config.base_policy.horizon.prediction_horizon, self.ac_dim)
+
+            next_actions = self.base_policy._get_action_trajectory(next_obs, goal_dict=None, noisy_action=next_noise_samples)
+            next_pred_q = self._get_base_critic_target_q_values(next_obs, next_actions, None)
+            next_pred_q = next_pred_q - ent_coeff * next_noise_log_probs
+
+            target_q = rewards + self.global_config.train.discount_factor * (1 - dones) * next_pred_q
 
         base_critic_losses = []
         loss_fn = nn.SmoothL1Loss() if self.algo_config.base_critic.use_huber else nn.MSELoss()
@@ -382,7 +416,8 @@ class DSRL(PolicyAlgo, ValueAlgo):
         
         actions = self.base_policy._get_action_trajectory(obs, None, noisy_actions)
         dsrl_qs = [critic(obs_dict=obs, acts=noisy_actions, goal_dict=None) for critic in self.nets["dsrl_critic"]]
-        base_qs = [critic(obs_dict=obs, acts=actions, goal_dict=None) for critic in self.nets["base_critic"]]
+        with torch.no_grad():
+            base_qs = [critic(obs_dict=obs, acts=actions, goal_dict=None) for critic in self.nets["base_critic"]]
 
         dsrl_q_losses = []
         loss_fn = nn.SmoothL1Loss() if self.algo_config.dsrl_critic.use_huber else nn.MSELoss()
@@ -412,11 +447,19 @@ class DSRL(PolicyAlgo, ValueAlgo):
 
         obs = batch["obs"]
 
+        # Update entropy coefficient
+        ent_coeff, ent_coeff_loss = self._update_entropy_coefficient_on_batch(batch, no_backprop)
+        info["dsrl_policy/ent_coeff"] = ent_coeff
+        info["dsrl_policy/ent_coeff_loss"] = ent_coeff_loss
+
         noisy_actions_dist = self.nets["dsrl_policy"].forward_train(obs, goal_dict=None)
-        noisy_actions = noisy_actions_dist.rsample() * self.dsrl_policy_beta
+        noisy_actions = noisy_actions_dist.rsample()
+        noisy_actions_log_probs = noisy_actions_dist.log_prob(noisy_actions).unsqueeze(1)
+        noisy_actions = noisy_actions * self.dsrl_policy_beta
+        noisy_actions = noisy_actions.reshape(-1, self.algo_config.base_policy.horizon.prediction_horizon, self.ac_dim)
 
         dsrl_qs = self._get_dsrl_critic_target_q_values(obs, noisy_actions, None)
-        dsrl_loss = -dsrl_qs.mean()
+        dsrl_loss = -dsrl_qs.mean() + ent_coeff * noisy_actions_log_probs.mean()
         info["dsrl_policy/loss"] = dsrl_loss
         info["dsrl_policy/q_pred"] = dsrl_qs.mean()
 

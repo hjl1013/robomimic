@@ -439,6 +439,7 @@ def main(args):
         config.experiment.epoch_every_n_steps = 3
         config.experiment.validation_epoch_every_n_steps = 3
         config.train.num_epochs = 2
+        config.train.online_rollout_collection.n = 1
 
         # if rollouts are enabled, try 2 rollouts at end of each epoch, with 10 environment steps
         config.experiment.rollout.rate = 1
