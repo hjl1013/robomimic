@@ -172,12 +172,11 @@ class Expo(PolicyAlgo, ValueAlgo):
         Returns:
             q_values (torch.Tensor): (N, ) sized Q-values
         """
-        with torch.no_grad():
-            q_values = torch.cat([
-                target_critic(obs_dict, action, goal_dict)
-                for target_critic in self.nets["critic_target"]
-            ], dim=1)
-            return q_values.min(dim=1).values.unsqueeze(1)
+        q_values = torch.cat([
+            target_critic(obs_dict, action, goal_dict)
+            for target_critic in self.nets["critic_target"]
+        ], dim=1)
+        return q_values.min(dim=1).values.unsqueeze(1)
 
     def _get_q_values(self, obs_dict, action, goal_dict):
         """
@@ -192,12 +191,11 @@ class Expo(PolicyAlgo, ValueAlgo):
             q_values (torch.Tensor): (N, ) sized Q-values
         TODO: Make this parallelized
         """
-        with torch.no_grad():
-            q_values = torch.cat([
-                critic(obs_dict, action, goal_dict)
-                for critic in self.nets["critic"]
-            ], dim=1)
-            return q_values.min(dim=1).values.unsqueeze(1)
+        q_values = torch.cat([
+            critic(obs_dict, action, goal_dict)
+            for critic in self.nets["critic"]
+        ], dim=1)
+        return q_values.min(dim=1).values.unsqueeze(1)
 
     def get_action(self, obs_dict, goal_dict=None):
         """
@@ -332,10 +330,10 @@ class Expo(PolicyAlgo, ValueAlgo):
                    for critic in self.nets["critic"]]
 
         # target Q value
-        next_actions = self.get_action(next_obs)
-        target_qs = self._get_target_q_values(obs, next_actions, None)
-        q_target = rewards + self.global_config.train.discount_factor * (1 - dones) * target_qs
-        q_target = q_target.detach()
+        with torch.no_grad():
+            next_actions = self.get_action(next_obs)
+            target_qs = self._get_target_q_values(obs, next_actions, None)
+            q_target = rewards + self.global_config.train.discount_factor * (1 - dones) * target_qs
 
         # compute critic losses
         critic_losses = []
@@ -399,9 +397,9 @@ class Expo(PolicyAlgo, ValueAlgo):
         a_hat = dist.rsample() * self.edit_policy_beta  # reparameterized sampling
         log_prob = dist.log_prob(a_hat)  # shape [B,]
 
-        # 3. evaluate Q(s, a + a_hat)
+        # 3. evaluate Q_target(s, a + a_hat)
         combined_action = base_actions + a_hat
-        q_pred = self._get_q_values(obs, combined_action, goal_dict=None)  # shape [B, 1]
+        q_pred = self._get_target_q_values(obs, combined_action, goal_dict=None)  # shape [B, 1]
 
         # 4. compute loss
         alpha = self.algo_config.edit_policy.entropy_weight  # entropy regularization
