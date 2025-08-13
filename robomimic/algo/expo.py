@@ -224,7 +224,7 @@ class Expo(PolicyAlgo, ValueAlgo):
 
         # combine base actions and action edits
         action_samples = base_actions + edit_actions # [N * sample_num, ac_dim]
-        q_values = self._get_q_values(edit_policy_obs_dict, action_samples, goal_dict) # [N * sample_num, 1]
+        q_values = self._get_target_q_values(edit_policy_obs_dict, action_samples, goal_dict) # [N * sample_num, 1]
         
         # reshape action and q_values
         action_samples = action_samples.reshape(-1, sample_num, self.ac_dim) # [N, sample_num, ac_dim]
@@ -260,7 +260,7 @@ class Expo(PolicyAlgo, ValueAlgo):
 
         # combine base actions and action edits and calculate q-values
         action_samples = base_actions + edit_actions # [N * sample_num, ac_dim]
-        q_values = self._get_q_values(edit_policy_obs_dict, action_samples, goal_dict) # [N * sample_num, 1]
+        q_values = self._get_target_q_values(edit_policy_obs_dict, action_samples, goal_dict) # [N * sample_num, 1]
         
         # reshape q_values and select the action with the highest Q-value
         q_values = q_values.reshape(-1, sample_num) # [N, sample_num]
