@@ -240,8 +240,14 @@ def playback_dataset(args):
         ObsUtils.initialize_obs_utils_with_obs_specs(obs_modality_specs=dummy_spec)
 
         env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=args.dataset)
-        env_meta["env_kwargs"]["controller_configs"]["body_parts"]["right"]["control_delta"] = False
-        env_meta["env_kwargs"]["controller_configs"]["body_parts"]["right"]["input_type"] = "absolute"
+
+        if args.use_abs_actions:
+            env_meta["env_kwargs"]["controller_configs"]["body_parts"]["right"]["control_delta"] = False
+            env_meta["env_kwargs"]["controller_configs"]["body_parts"]["right"]["input_type"] = "absolute"
+        else:
+            env_meta["env_kwargs"]["controller_configs"]["body_parts"]["right"]["control_delta"] = True
+            env_meta["env_kwargs"]["controller_configs"]["body_parts"]["right"]["input_type"] = "delta"
+            
         env = EnvUtils.create_env_from_metadata(env_meta=env_meta, render=args.render, render_offscreen=write_video)
 
         # some operations for playback are robosuite-specific, so determine if this environment is a robosuite env
@@ -292,9 +298,11 @@ def playback_dataset(args):
 
         # supply actions if using open-loop action playback
         actions = None
-        if args.use_actions:
+        assert not (args.use_abs_actions and args.use_actions)
+        if args.use_abs_actions:
             actions = f["data/{}/actions_abs".format(ep)][()]
-            # actions = f["data/{}/actions".format(ep)][()]
+        if args.use_actions:
+            actions = f["data/{}/actions".format(ep)][()]
 
         playback_trajectory_with_env(
             env=env, 
@@ -344,6 +352,12 @@ if __name__ == "__main__":
     # Playback stored dataset actions open-loop instead of loading from simulation states.
     parser.add_argument(
         "--use-actions",
+        action='store_true',
+        help="use open-loop action playback instead of loading sim states",
+    )
+
+    parser.add_argument(
+        "--use-abs-actions",
         action='store_true',
         help="use open-loop action playback instead of loading sim states",
     )
