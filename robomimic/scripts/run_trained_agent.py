@@ -57,7 +57,7 @@ import h5py
 import imageio
 import numpy as np
 from copy import deepcopy
-
+from tqdm import tqdm
 import torch
 
 import robomimic
@@ -227,7 +227,7 @@ def run_trained_agent(args):
         total_samples = 0
 
     rollout_stats = []
-    for i in range(rollout_num_episodes):
+    for i in tqdm(range(rollout_num_episodes)):
         stats, traj = rollout(
             policy=policy, 
             env=env, 
