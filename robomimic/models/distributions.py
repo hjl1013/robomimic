@@ -68,7 +68,7 @@ class TanhWrappedDistribution(D.Distribution):
 
     @property
     def mean(self):
-        return self.base_dist.mean
+        return torch.tanh(self.base_dist.mean) * self.scale
 
     @property
     def stddev(self):

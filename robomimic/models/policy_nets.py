@@ -208,6 +208,7 @@ class GaussianActorNetwork(ActorNetwork):
         std_limits=(0.007, 7.5),
         low_noise_eval=True,
         use_tanh=False,
+        scale=1.0,
         goal_shapes=None,
         encoder_kwargs=None,
     ):
@@ -248,6 +249,8 @@ class GaussianActorNetwork(ActorNetwork):
                 at eval time.
 
             use_tanh (bool): if True, use a tanh-Gaussian distribution
+
+            scale (float): scale of the action space. Only used if use_tanh is True.
 
             goal_shapes (OrderedDict): a dictionary that maps modality to
                 expected shapes for goal observations.
@@ -293,6 +296,7 @@ class GaussianActorNetwork(ActorNetwork):
 
         self.low_noise_eval = low_noise_eval
         self.use_tanh = use_tanh
+        self.scale = scale
 
         super(GaussianActorNetwork, self).__init__(
             obs_shapes=obs_shapes,
@@ -363,7 +367,7 @@ class GaussianActorNetwork(ActorNetwork):
 
         if self.use_tanh:
             # Wrap distribution with Tanh
-            dist = TanhWrappedDistribution(base_dist=dist, scale=1.)
+            dist = TanhWrappedDistribution(base_dist=dist, scale=self.scale)
 
         return dist
 
@@ -380,10 +384,6 @@ class GaussianActorNetwork(ActorNetwork):
         """
         dist = self.forward_train(obs_dict, goal_dict)
         if self.low_noise_eval and (not self.training):
-            if self.use_tanh:
-                # # scaling factor lets us output actions like [-1. 1.] and is consistent with the distribution transform
-                # return (1. + 1e-6) * torch.tanh(dist.base_dist.mean)
-                return torch.tanh(dist.mean)
             return dist.mean
         return dist.sample()
 

@@ -131,10 +131,10 @@ class Expo(PolicyAlgo, ValueAlgo):
             mlp_layer_dims=self.algo_config.edit_policy.layer_dims,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
             use_tanh=True,
+            scale=self.algo_config.edit_policy.beta,
         )
 
         self.nets["edit_policy"] = edit_policy_class(**edit_policy_args)
-        self.edit_policy_beta = self.algo_config.edit_policy.beta
     
     def _create_critic(self):
         """
@@ -220,7 +220,7 @@ class Expo(PolicyAlgo, ValueAlgo):
         # sample action edits
         edit_policy_obs_dict = copy.deepcopy(duplicated_obs_dict)
         edit_policy_obs_dict["base_action"] = base_actions
-        edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) * self.edit_policy_beta # [N * sample_num, ac_dim]
+        edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) # [N * sample_num, ac_dim]
 
         # combine base actions and action edits
         action_samples = base_actions + edit_actions # [N * sample_num, ac_dim]
@@ -256,7 +256,7 @@ class Expo(PolicyAlgo, ValueAlgo):
         # sample action edits
         edit_policy_obs_dict = copy.deepcopy(duplicated_obs_dict)
         edit_policy_obs_dict["base_action"] = base_actions
-        edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) * self.edit_policy_beta # [N * sample_num, ac_dim]
+        edit_actions = self.nets["edit_policy"](edit_policy_obs_dict, goal_dict) # [N * sample_num, ac_dim]
 
         # combine base actions and action edits and calculate q-values
         action_samples = base_actions + edit_actions # [N * sample_num, ac_dim]
@@ -271,29 +271,6 @@ class Expo(PolicyAlgo, ValueAlgo):
         edit_actions = edit_actions.reshape(-1, sample_num, self.ac_dim) # [N, sample_num, ac_dim]
 
         return base_actions[torch.arange(base_actions.shape[0]), action_index, :], edit_actions[torch.arange(edit_actions.shape[0]), action_index, :] # [N, ac_dim]
-
-    def _compute_critic_loss(self, critic, states, actions, goal_states, q_targets):
-        """
-        Helper function to compute loss between estimated Q-values and target Q-values.
-
-        Nearly the same as BCQ (return type slightly different).
-
-        Args:
-            critic (torch.nn.Module): critic network
-            states (dict): batch of observations
-            actions (torch.Tensor): batch of actions
-            goal_states (dict): if not None, batch of goal observations
-            q_targets (torch.Tensor): batch of target q-values for the TD loss
-
-        Returns:
-            critic_loss (torch.Tensor): critic loss
-        """
-        q_estimated = critic(states, actions, goal_states)
-        if self.algo_config.critic.use_huber:
-            critic_loss = nn.SmoothL1Loss()(q_estimated, q_targets)
-        else:
-            critic_loss = nn.MSELoss()(q_estimated, q_targets)
-        return critic_loss
 
     def _train_critic_on_batch(self, batch, epoch, no_backprop=False):
         """
@@ -394,7 +371,7 @@ class Expo(PolicyAlgo, ValueAlgo):
 
         # 2. sample edit actions (a_hat) and get distribution
         dist = self.nets["edit_policy"].forward_train(edit_policy_obs_dict, goal_dict=None)
-        a_hat = dist.rsample() * self.edit_policy_beta  # reparameterized sampling
+        a_hat = dist.rsample()  # reparameterized sampling
         log_prob = dist.log_prob(a_hat)  # shape [B,]
 
         # 3. evaluate Q_target(s, a + a_hat)

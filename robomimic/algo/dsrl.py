@@ -121,9 +121,9 @@ class DSRL(PolicyAlgo, ValueAlgo):
             mlp_layer_dims=self.algo_config.dsrl_policy.layer_dims,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
             use_tanh=True,
+            scale=self.algo_config.dsrl_policy.beta,
         )
         self.nets["dsrl_policy"] = PolicyNets.GaussianActorNetwork(**dsrl_policy_args)
-        self.dsrl_policy_beta = self.algo_config.dsrl_policy.beta
 
     def _create_base_critic(self):
         """
@@ -190,7 +190,7 @@ class DSRL(PolicyAlgo, ValueAlgo):
         Returns:
             action (torch.Tensor): action
         """
-        noisy_action = self.nets["dsrl_policy"](obs_dict, goal_dict) * self.dsrl_policy_beta # [N, ac_dim * prediction_horizon]
+        noisy_action = self.nets["dsrl_policy"](obs_dict, goal_dict) # [N, ac_dim * prediction_horizon]
         noisy_action = noisy_action.reshape(-1, self.algo_config.base_policy.horizon.prediction_horizon, self.ac_dim) # [N, prediction_horizon, ac_dim]
         action = self.base_policy._get_action_trajectory(obs_dict, goal_dict, noisy_action) # [N, prediction_horizon, ac_dim]
         return action
@@ -334,9 +334,8 @@ class DSRL(PolicyAlgo, ValueAlgo):
         obs = batch["obs"]
 
         action_pred_dist = self.nets["dsrl_policy"].forward_train(obs, goal_dict=None)
-        action_pred_samples = action_pred_dist.rsample()
+        action_pred_samples = action_pred_dist.sample()
         action_pred_log_probs = action_pred_dist.log_prob(action_pred_samples)
-        action_pred_samples = action_pred_samples * self.dsrl_policy_beta
         ent_coeff = torch.exp(self.log_ent_coef.detach())
         ent_coeff_loss = -(self.log_ent_coef * (action_pred_log_probs + self.target_entropy).detach()).mean()
         if not no_backprop:
@@ -363,9 +362,8 @@ class DSRL(PolicyAlgo, ValueAlgo):
 
         with torch.no_grad():
             next_noise_dist = self.nets["dsrl_policy"].forward_train(next_obs, goal_dict=None)
-            next_noise_samples = next_noise_dist.rsample()
+            next_noise_samples = next_noise_dist.sample()
             next_noise_log_probs = next_noise_dist.log_prob(next_noise_samples).unsqueeze(1)
-            next_noise_samples = next_noise_samples * self.dsrl_policy_beta
             next_noise_samples = next_noise_samples.reshape(-1, self.algo_config.base_policy.horizon.prediction_horizon, self.ac_dim)
 
             next_actions = self.base_policy._get_action_trajectory(next_obs, goal_dict=None, noisy_action=next_noise_samples)
@@ -455,7 +453,6 @@ class DSRL(PolicyAlgo, ValueAlgo):
         noisy_actions_dist = self.nets["dsrl_policy"].forward_train(obs, goal_dict=None)
         noisy_actions = noisy_actions_dist.rsample()
         noisy_actions_log_probs = noisy_actions_dist.log_prob(noisy_actions).unsqueeze(1)
-        noisy_actions = noisy_actions * self.dsrl_policy_beta
         noisy_actions = noisy_actions.reshape(-1, self.algo_config.base_policy.horizon.prediction_horizon, self.ac_dim)
 
         dsrl_qs = self._get_dsrl_critic_target_q_values(obs, noisy_actions, None)
