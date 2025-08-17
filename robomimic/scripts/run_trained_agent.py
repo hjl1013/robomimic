@@ -172,6 +172,8 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
         else:
             traj[k] = np.array(traj[k])
 
+    traj["dones"][-1] = True
+
     return stats, traj
 
 
