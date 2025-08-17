@@ -259,7 +259,11 @@ def train(config, device, resume=False):
         print("Collecting rollouts")
         num_episodes = config.train.online_rollout_collection.n
         success_count = 0
-        for _ in LogUtils.custom_tqdm(range(num_episodes)):
+        for episode_idx in LogUtils.custom_tqdm(range(num_episodes)):
+            # Set seed for each episode
+            np.random.seed(config.train.seed + num_episodes * epoch + episode_idx)
+            torch.manual_seed(config.train.seed + num_episodes * epoch + episode_idx)
+
             stats, traj = rollout(
                 policy=rollout_model,
                 env=envs[list(envs.keys())[0]],
